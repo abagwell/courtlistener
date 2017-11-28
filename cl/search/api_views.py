@@ -1,31 +1,70 @@
 from rest_framework import status, pagination, viewsets, permissions, response
 
-from cl.api.utils import LoggingMixin
+from cl.api.utils import LoggingMixin, RECAPUsersReadOnly
 from cl.search import api_utils
 from cl.search.api_serializers import (
     DocketSerializer, CourtSerializer, OpinionClusterSerializer,
     OpinionSerializer, SearchResultSerializer,
-    OpinionsCitedSerializer)
+    OpinionsCitedSerializer, DocketEntrySerializer, RECAPDocumentSerializer,
+    TagSerializer,
+)
 from cl.search.filters import (
     DocketFilter, CourtFilter, OpinionClusterFilter, OpinionFilter,
-    OpinionsCitedFilter)
+    OpinionsCitedFilter, DocketEntryFilter, RECAPDocumentFilter)
 from cl.search.forms import SearchForm
 from cl.search.models import Docket, Court, OpinionCluster, Opinion, \
-    OpinionsCited
+    OpinionsCited, DocketEntry, RECAPDocument, Tag
 
 
 class DocketViewSet(LoggingMixin, viewsets.ModelViewSet):
-    queryset = Docket.objects.all()
+    queryset = Docket.objects.select_related(
+        'court',
+        'assigned_to',
+        'referred_to',
+    ).prefetch_related(
+        'clusters',
+        'audio_files',
+        'tags',
+    )
     serializer_class = DocketSerializer
     filter_class = DocketFilter
     ordering_fields = (
         'date_created', 'date_modified', 'date_argued', 'date_reargued',
-        'date_reargument_denied', 'date_blocked',
+        'date_reargument_denied', 'date_blocked', 'date_cert_granted',
+        'date_cert_denied', 'date_filed', 'date_terminated', 'date_last_filing',
     )
 
 
+class DocketEntryViewSet(LoggingMixin, viewsets.ModelViewSet):
+    queryset = DocketEntry.objects.select_related(
+        'docket',   # For links back to dockets
+    ).prefetch_related(
+        'recap_documents',        # Sub items
+        'recap_documents__tags',  # Sub-sub items
+        'tags',                   # Tags on docket entries
+    ).order_by()
+
+    permission_classes = (RECAPUsersReadOnly,)
+    serializer_class = DocketEntrySerializer
+    filter_class = DocketEntryFilter
+    ordering_fields = ('date_created', 'date_modified', 'date_filed')
+
+
+class RECAPDocumentViewSet(LoggingMixin, viewsets.ModelViewSet):
+    permission_classes = (RECAPUsersReadOnly,)
+    queryset = RECAPDocument.objects.select_related(
+        'docket_entry',
+        'docket_entry__docket',
+    ).prefetch_related(
+        'tags',
+    ).order_by()
+    serializer_class = RECAPDocumentSerializer
+    filter_class = RECAPDocumentFilter
+    ordering_fields = ('date_created', 'date_modified', 'date_upload')
+
+
 class CourtViewSet(LoggingMixin, viewsets.ModelViewSet):
-    queryset = Court.objects.exclude(jurisdiction='T')
+    queryset = Court.objects.exclude(jurisdiction=Court.TESTING_COURT)
     serializer_class = CourtSerializer
     filter_class = CourtFilter
     ordering_fields = (
@@ -34,7 +73,11 @@ class CourtViewSet(LoggingMixin, viewsets.ModelViewSet):
 
 
 class OpinionClusterViewSet(LoggingMixin, viewsets.ModelViewSet):
-    queryset = OpinionCluster.objects.all()
+    queryset = OpinionCluster.objects.prefetch_related(
+        'sub_opinions',
+        'panel',
+        'non_participating_judges',
+    )
     serializer_class = OpinionClusterSerializer
     filter_class = OpinionClusterFilter
     ordering_fields = (
@@ -44,7 +87,13 @@ class OpinionClusterViewSet(LoggingMixin, viewsets.ModelViewSet):
 
 
 class OpinionViewSet(LoggingMixin, viewsets.ModelViewSet):
-    queryset = Opinion.objects.all()
+    queryset = Opinion.objects.select_related(
+        'cluster',
+        'author',
+    ).prefetch_related(
+        'opinions_cited',
+        'joined_by',
+    )
     serializer_class = OpinionSerializer
     filter_class = OpinionFilter
     ordering_fields = (
@@ -56,6 +105,12 @@ class OpinionsCitedViewSet(LoggingMixin, viewsets.ModelViewSet):
     queryset = OpinionsCited.objects.all()
     serializer_class = OpinionsCitedSerializer
     filter_class = OpinionsCitedFilter
+
+
+class TagViewSet(LoggingMixin, viewsets.ModelViewSet):
+    permission_classes = (RECAPUsersReadOnly,)
+    queryset = Tag.objects.all()
+    serializer_class = TagSerializer
 
 
 class SearchViewSet(LoggingMixin, viewsets.ViewSet):

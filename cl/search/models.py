@@ -1,40 +1,28 @@
 # coding=utf-8
+import os
 import re
 from datetime import datetime, time
 
 from celery.canvas import chain
 from django.conf import settings
+from django.contrib.contenttypes.fields import GenericRelation
 from django.core.exceptions import ValidationError
 from django.core.urlresolvers import reverse, NoReverseMatch
 from django.db import models
+from django.db.models import Prefetch
 from django.template import loader
 from django.utils.encoding import smart_unicode
 from django.utils.text import slugify
 
 from cl.custom_filters.templatetags.text_filters import best_case_name
+from cl.lib import fields
 from cl.lib.model_helpers import make_upload_path, make_recap_path, \
     make_recap_pdf_path
-from cl.lib.search_index_utils import InvalidDocumentError, null_map, normalize_search_dicts
+from cl.lib.search_index_utils import InvalidDocumentError, null_map, \
+    normalize_search_dicts
 from cl.lib.storage import IncrementingFileSystemStorage
 from cl.lib.string_utils import trunc
 
-# changes here need to be mirrored in the coverage page view and Solr configs
-# Note that spaces cannot be used in the keys, or else the SearchForm won't work
-JURISDICTIONS = (
-    ('F',   'Federal Appellate'),
-    ('FD',  'Federal District'),
-    ('FB',  'Federal Bankruptcy'),
-    ('FBP', 'Federal Bankruptcy Panel'),
-    ('FS',  'Federal Special'),
-    ('S',   'State Supreme'),
-    ('SA',  'State Appellate'),
-    ('ST',  'State Trial'),
-    ('SS',  'State Special'),
-    ('SAG', 'State Attorney General'),
-    ('C',   'Committee'),
-    ('I',   'International'),
-    ('T',   'Testing'),
-)
 
 DOCUMENT_STATUSES = (
     ('Published', 'Precedential'),
@@ -106,6 +94,19 @@ class Docket(models.Model):
         help_text="The court where the docket was filed",
         db_index=True,
         related_name='dockets',
+    )
+    tags = models.ManyToManyField(
+        'search.Tag',
+        help_text="The tags associated with the docket.",
+        related_name="dockets",
+        blank=True,
+    )
+    html_documents = GenericRelation(
+        'recap.PacerHtmlFiles',
+        help_text="Original HTML files collected from PACER.",
+        related_query_name='dockets',
+        null=True,
+        blank=True,
     )
     assigned_to = models.ForeignKey(
         'people_db.Person',
@@ -188,7 +189,8 @@ class Docket(models.Model):
         null=True,
     )
     date_last_filing = models.DateField(
-        help_text="The date the case was last updated in the docket. ",
+        help_text="The date the case was last updated in the docket, as shown "
+                  "in PACER's Docket History report.",
         blank=True,
         null=True,
     )
@@ -211,17 +213,19 @@ class Docket(models.Model):
         db_index=False,
         blank=True,
     )
-    docket_number = models.CharField(
+    docket_number = fields.CharNullField(
         help_text="The docket numbers of a case, can be consolidated and "
                   "quite long",
         max_length=5000,  # was 50, 100, 300, 1000
         blank=True,
+        null=True,
         db_index=True,
     )
-    pacer_case_id = models.CharField(
+    pacer_case_id = fields.CharNullField(
         help_text="The cased ID provided by PACER.",
         max_length=100,
         blank=True,
+        null=True,
         db_index=True,
     )
     cause = models.CharField(
@@ -275,6 +279,9 @@ class Docket(models.Model):
         default=False,
     )
 
+    class Meta:
+        unique_together = ('docket_number', 'pacer_case_id', 'court')
+
     def __unicode__(self):
         if self.case_name:
             return smart_unicode('%s: %s' % (self.pk, self.case_name))
@@ -283,9 +290,11 @@ class Docket(models.Model):
 
     def save(self, *args, **kwargs):
         self.slug = slugify(trunc(best_case_name(self), 75))
-        if self.source == 1 and not self.pacer_case_id:
-            raise ValidationError("pacer_case_id cannot be Null or empty in "
-                                  "RECAP documents.")
+        if self.source in self.RECAP_SOURCES:
+            for field in ['pacer_case_id', 'docket_number']:
+                if not getattr(self, field, None):
+                    raise ValidationError("'%s' cannot be Null or empty in "
+                                          "RECAP documents." % field)
 
         super(Docket, self).save(*args, **kwargs)
 
@@ -298,9 +307,41 @@ class Docket(models.Model):
             return None
         from cl.lib.pacer import map_cl_to_pacer_id
         court_id = map_cl_to_pacer_id(self.court.pk)
-        return u"https://ecf.%s.uscourts.gov/cgi-bin/DktRpt.pl?%s" % (
-            court_id,
-            self.pacer_case_id,
+        if self.court.jurisdiction == Court.FEDERAL_APPELLATE:
+            return (u'https://ecf.%s.uscourts.gov/n/beam/servlet/TransportRoom?'
+                    u'servlet=CaseSummary.jsp&'
+                    u'caseNum=%s&'
+                    u'incOrigDkt=Y&' 
+                    u'incDktEntries=Y') % (
+                court_id,
+                self.pacer_case_id,
+            )
+        else:
+            return u"https://ecf.%s.uscourts.gov/cgi-bin/DktRpt.pl?%s" % (
+                court_id,
+                self.pacer_case_id,
+            )
+
+    @property
+    def prefetched_parties(self):
+        """Prefetch the attorneys and firms associated with a docket and put
+        those values into the `attys_in_docket` and `firms_in_docket`
+        attributes.
+
+        :return: A parties queryset with the correct values prefetched.
+        """
+        from cl.people_db.models import Attorney, AttorneyOrganization
+        return self.parties.prefetch_related(
+            Prefetch('attorneys',
+                     queryset=Attorney.objects.filter(
+                         roles__docket=self
+                     ).distinct().only('pk', 'name'),
+                     to_attr='attys_in_docket'),
+            Prefetch('attys_in_docket__organizations',
+                     queryset=AttorneyOrganization.objects.filter(
+                         attorney_organization_associations__docket=self
+                     ).distinct().only('pk', 'name'),
+                     to_attr='firms_in_docket')
         )
 
     def as_search_list(self):
@@ -356,15 +397,15 @@ class Docket(models.Model):
             'firm_id': set(),
             'firm': set(),
         })
-        for p in self.parties.all():
+        for p in self.prefetched_parties:
             out['party_id'].add(p.pk)
             out['party'].add(p.name)
-            for a in p.attorneys.all():
+            for a in p.attys_in_docket:
                 out['attorney_id'].add(a.pk)
                 out['attorney'].add(a.name)
-                for org in a.organizations.all():
-                    out['firm_id'].add(org.pk)
-                    out['firm'].add(org.name)
+                for f in a.firms_in_docket:
+                    out['firm_id'].add(f.pk)
+                    out['firm'].add(f.name)
 
         # Do RECAPDocument and Docket Entries in a nested loop
         for de in self.docket_entries.all():
@@ -397,7 +438,7 @@ class Docket(models.Model):
                     'page_count': rd.page_count,
                 })
                 if hasattr(rd.filepath_local, 'path'):
-                    out['filepath_local'] = self.filepath_local.path
+                    out['filepath_local'] = rd.filepath_local.path
                 try:
                     out['absolute_url'] = rd.get_absolute_url()
                 except NoReverseMatch:
@@ -422,6 +463,19 @@ class DocketEntry(models.Model):
         help_text="Foreign key as a relation to the corresponding Docket "
                   "object. Specifies which docket the docket entry belongs to.",
         related_name="docket_entries",
+    )
+    tags = models.ManyToManyField(
+        'search.Tag',
+        help_text="The tags associated with the docket entry.",
+        related_name="docket_entries",
+        blank=True,
+    )
+    html_documents = GenericRelation(
+        'recap.PacerHtmlFiles',
+        help_text="HTML attachment files collected from PACER.",
+        related_query_name='docket_entries',
+        null=True,
+        blank=True,
     )
     date_created = models.DateTimeField(
         help_text="The time when this item was created.",
@@ -451,6 +505,9 @@ class DocketEntry(models.Model):
         unique_together = ('docket', 'entry_number')
         verbose_name_plural = 'Docket Entries'
         ordering = ('entry_number',)
+        permissions = (
+            ("has_recap_api_access", "Can work with RECAP API"),
+        )
 
     def __unicode__(self):
         return "<DocketEntry:%s ---> %s >" % (
@@ -485,6 +542,12 @@ class RECAPDocument(models.Model):
                   "Multiple documents can belong to a DocketEntry. "
                   "(Attachments and Documents together)",
         related_name="recap_documents",
+    )
+    tags = models.ManyToManyField(
+        'search.Tag',
+        help_text="The tags associated with the document.",
+        related_name="recap_documents",
+        blank=True,
     )
     date_created = models.DateTimeField(
         help_text="The date the file was imported to Local Storage.",
@@ -578,7 +641,10 @@ class RECAPDocument(models.Model):
     class Meta:
         unique_together = ('docket_entry', 'document_number',
                            'attachment_number')
-        ordering = ('document_number', 'attachment_number')
+        ordering = ("document_type", 'document_number', 'attachment_number')
+        permissions = (
+            ("has_recap_api_access", "Can work with RECAP API"),
+        )
 
     def __unicode__(self):
         return "%s: Docket_%s , document_number_%s , attachment_number_%s" % (
@@ -615,13 +681,14 @@ class RECAPDocument(models.Model):
     @property
     def needs_extraction(self):
         """Does the item need extraction and does it have all the right
-        fields?
+        fields? Items needing OCR still need extraction.
         """
-        return bool(all([
-            self.ocr_status is None,
+        return all([
+            self.ocr_status is None or self.ocr_status == self.OCR_NEEDED,
             self.is_available is True,
-            bool(self.filepath_local.name),  # Just in case
-        ]))
+            # Has a value in filepath field, which points to a file.
+            self.filepath_local and os.path.isfile(self.filepath_local.path),
+        ])
 
     def save(self, do_extraction=False, index=False, *args, **kwargs):
         if self.document_type == self.ATTACHMENT:
@@ -659,7 +726,8 @@ class RECAPDocument(models.Model):
             tasks.append(extract_recap_pdf.si(self.pk))
         if index:
             from cl.search.tasks import add_or_update_recap_document
-            tasks.append(add_or_update_recap_document.si([self.pk], False))
+            tasks.append(add_or_update_recap_document.si([self.pk],
+                                                         force_commit=False))
         if len(tasks) > 0:
             chain(*tasks)()
 
@@ -673,24 +741,99 @@ class RECAPDocument(models.Model):
         from cl.search.tasks import delete_items
         delete_items.delay([id_cache], settings.SOLR_RECAP_URL)
 
-    def as_search_dict(self):
+    def get_docket_metadata(self):
+        """The metadata for the item that comes from the Docket."""
+        docket = self.docket_entry.docket
+        # IDs
+        out = {
+            'docket_id': docket.pk,
+            'court_id': docket.court.pk,
+            'assigned_to_id': getattr(docket.assigned_to, 'pk', None),
+            'referred_to_id': getattr(docket.referred_to, 'pk', None)
+        }
+
+        # Docket
+        out.update({
+            'docketNumber': docket.docket_number,
+            'caseName': best_case_name(docket),
+            'suitNature': docket.nature_of_suit,
+            'cause': docket.cause,
+            'juryDemand': docket.jury_demand,
+            'jurisdictionType': docket.jurisdiction_type,
+        })
+        if docket.date_argued is not None:
+            out['dateArgued'] = datetime.combine(docket.date_argued, time())
+        if docket.date_filed is not None:
+            out['dateFiled'] = datetime.combine(docket.date_filed, time())
+        if docket.date_terminated is not None:
+            out['dateTerminated'] = datetime.combine(docket.date_terminated,
+                                                     time())
+        try:
+            out['docket_absolute_url'] = docket.get_absolute_url()
+        except NoReverseMatch:
+            raise InvalidDocumentError(
+                "Unable to save to index due to missing absolute_url: %s"
+                % self.pk
+            )
+
+        # Judges
+        if docket.assigned_to is not None:
+            out['assignedTo'] = docket.assigned_to.name_full
+        elif docket.assigned_to_str:
+            out['assignedTo'] = docket.assigned_to_str
+        if docket.referred_to is not None:
+            out['referredTo'] = docket.referred_to.name_full
+        elif docket.referred_to_str:
+            out['referredTo'] = docket.referred_to_str
+
+        # Court
+        out.update({
+            'court': docket.court.full_name,
+            'court_exact': docket.court_id,  # For faceting
+            'court_citation_string': docket.court.citation_string
+        })
+
+        # Parties, Attorneys, Firms
+        out.update({
+            'party_id': set(),
+            'party': set(),
+            'attorney_id': set(),
+            'attorney': set(),
+            'firm_id': set(),
+            'firm': set(),
+        })
+        for p in docket.prefetched_parties:
+            out['party_id'].add(p.pk)
+            out['party'].add(p.name)
+            for a in p.attys_in_docket:
+                out['attorney_id'].add(a.pk)
+                out['attorney'].add(a.name)
+                for f in a.firms_in_docket:
+                    out['firm_id'].add(f.pk)
+                    out['firm'].add(f.name)
+
+        return out
+
+    def as_search_dict(self, docket_metadata=None):
         """Create a dict that can be ingested by Solr.
 
         Search results are presented as Dockets, but they're indexed as
         RECAPDocument's, which are then grouped back together in search results
         to form Dockets.
+
+        Since it's common to update an entire docket, there's a shortcut,
+        get_docket_metadata that lets you query that information first and then
+        pass it in as an argument so that it doesn't have to be queried for
+        every RECAPDocument on the docket. This can provide big performance
+        boosts.
         """
+        out = docket_metadata or self.get_docket_metadata()
+
         # IDs
-        out = {
+        out.update({
             'id': self.pk,
             'docket_entry_id': self.docket_entry.pk,
-            'docket_id': self.docket_entry.docket.pk,
-            'court_id': self.docket_entry.docket.court.pk,
-            'assigned_to_id': getattr(
-                self.docket_entry.docket.assigned_to, 'pk', None),
-            'referred_to_id': getattr(
-                self.docket_entry.docket.referred_to, 'pk', None)
-        }
+        })
 
         # RECAPDocument
         out.update({
@@ -704,6 +847,14 @@ class RECAPDocument(models.Model):
         if hasattr(self.filepath_local, 'path'):
             out['filepath_local'] = self.filepath_local.path
 
+        try:
+            out['absolute_url'] = self.get_absolute_url()
+        except NoReverseMatch:
+            raise InvalidDocumentError(
+                "Unable to save to index due to missing absolute_url: %s"
+                % self.pk
+            )
+
         # Docket Entry
         out['description'] = self.docket_entry.description
         if self.docket_entry.entry_number is not None:
@@ -714,76 +865,6 @@ class RECAPDocument(models.Model):
                 time()
             )
 
-        # Docket
-        out.update({
-            'docketNumber': self.docket_entry.docket.docket_number,
-            'caseName': best_case_name(self.docket_entry.docket),
-            'suitNature': self.docket_entry.docket.nature_of_suit,
-            'cause': self.docket_entry.docket.cause,
-            'juryDemand': self.docket_entry.docket.jury_demand,
-            'jurisdictionType': self.docket_entry.docket.jurisdiction_type,
-        })
-        if self.docket_entry.docket.date_argued is not None:
-            out['dateArgued'] = datetime.combine(
-                self.docket_entry.docket.date_argued,
-                time()
-            )
-        if self.docket_entry.docket.date_filed is not None:
-            out['dateFiled'] = datetime.combine(
-                self.docket_entry.docket.date_filed,
-                time()
-            )
-        if self.docket_entry.docket.date_terminated is not None:
-            out['dateTerminated'] = datetime.combine(
-                self.docket_entry.docket.date_terminated,
-                time()
-            )
-        try:
-            out['absolute_url'] = self.get_absolute_url()
-            out['docket_absolute_url'] = self.docket_entry.docket.get_absolute_url()
-        except NoReverseMatch:
-            raise InvalidDocumentError(
-                "Unable to save to index due to missing absolute_url: %s"
-                % self.pk
-            )
-
-        # Judges
-        if self.docket_entry.docket.assigned_to is not None:
-            out['assignedTo'] = self.docket_entry.docket.assigned_to.name_full
-        elif self.docket_entry.docket.assigned_to_str:
-            out['assignedTo'] = self.docket_entry.docket.assigned_to_str
-        if self.docket_entry.docket.referred_to is not None:
-            out['referredTo'] = self.docket_entry.docket.referred_to.name_full
-        elif self.docket_entry.docket.referred_to_str:
-            out['referredTo'] = self.docket_entry.docket.referred_to_str
-
-        # Court
-        out.update({
-            'court': self.docket_entry.docket.court.full_name,
-            'court_exact': self.docket_entry.docket.court_id,  # For faceting
-            'court_citation_string': self.docket_entry.docket.court.citation_string
-        })
-
-        # Parties, Attorneys, Firms
-        out.update({
-            'party_id': set(),
-            'party': set(),
-            'attorney_id': set(),
-            'attorney': set(),
-            'firm_id': set(),
-            'firm': set(),
-        })
-        for p in self.docket_entry.docket.parties.prefetch_related(
-                'attorneys', 'attorneys__organizations'):
-            out['party_id'].add(p.pk)
-            out['party'].add(p.name)
-            for a in p.attorneys.all():
-                out['attorney_id'].add(a.pk)
-                out['attorney'].add(a.name)
-                for f in a.organizations.all():
-                    out['firm_id'].add(f.pk)
-                    out['firm'].add(f.name)
-
         text_template = loader.get_template('indexes/dockets_text.txt')
         out['text'] = text_template.render({'item': self}).translate(null_map)
 
@@ -793,10 +874,69 @@ class RECAPDocument(models.Model):
 class Court(models.Model):
     """A class to represent some information about each court, can be extended
     as needed."""
+    # Note that spaces cannot be used in the keys, or else the SearchForm won't
+    # work
+    FEDERAL_APPELLATE = 'F'
+    FEDERAL_DISTRICT = 'FD'
+    FEDERAL_BANKRUPTCY = 'FB'
+    FEDERAL_BANKRUPTCY_PANEL = 'FBP'
+    FEDERAL_SPECIAL = 'FS'
+    STATE_SUPREME = 'S'
+    STATE_APPELLATE = 'SA'
+    STATE_TRIAL = 'ST'
+    STATE_SPECIAL = 'SS'
+    STATE_ATTORNEY_GENERAL = 'SAG'
+    COMMITTEE = 'C'
+    INTERNATIONAL = 'I'
+    TESTING_COURT = 'T'
+    JURISDICTIONS = (
+        (FEDERAL_APPELLATE, 'Federal Appellate'),
+        (FEDERAL_DISTRICT, 'Federal District'),
+        (FEDERAL_BANKRUPTCY, 'Federal Bankruptcy'),
+        (FEDERAL_BANKRUPTCY_PANEL, 'Federal Bankruptcy Panel'),
+        (FEDERAL_SPECIAL, 'Federal Special'),
+        (STATE_SUPREME, 'State Supreme'),
+        (STATE_APPELLATE, 'State Appellate'),
+        (STATE_TRIAL, 'State Trial'),
+        (STATE_SPECIAL, 'State Special'),
+        (STATE_ATTORNEY_GENERAL, 'State Attorney General'),
+        (COMMITTEE, 'Committee'),
+        (INTERNATIONAL, 'International'),
+        (TESTING_COURT, 'Testing'),
+    )
+    FEDERAL_JURISDICTIONS = [
+        FEDERAL_APPELLATE,
+        FEDERAL_DISTRICT,
+        FEDERAL_SPECIAL,
+        FEDERAL_BANKRUPTCY,
+        FEDERAL_BANKRUPTCY_PANEL,
+    ]
+    STATE_JURISDICTIONS = [
+        STATE_SUPREME,
+        STATE_APPELLATE,
+        STATE_TRIAL,
+        STATE_SPECIAL,
+        STATE_ATTORNEY_GENERAL,
+    ]
+    BANKRUPTCY_JURISDICTIONS = [
+        FEDERAL_BANKRUPTCY,
+        FEDERAL_BANKRUPTCY_PANEL,
+    ]
     id = models.CharField(
         help_text='a unique ID for each court as used in URLs',
         max_length=15,  # Changes here will require updates in urls.py
         primary_key=True
+    )
+    pacer_court_id = models.PositiveSmallIntegerField(
+        help_text="The numeric ID for the court in PACER. This can be found by "
+                  "looking at the first three digits of any doc1 URL in PACER.",
+        null=True,
+        blank=True,
+    )
+    fjc_court_id = models.CharField(
+        help_text="The ID used by FJC in the Integrated Database",
+        max_length=3,
+        blank=True,
     )
     date_modified = models.DateTimeField(
         help_text="The last moment when the item was modified",
@@ -873,12 +1013,6 @@ class Court(models.Model):
     @property
     def is_terminated(self):
         if self.end_date:
-            return True
-        return False
-
-    @property
-    def is_bankruptcy(self):
-        if self.jurisdiction in ['FB', 'FBP']:
             return True
         return False
 
@@ -1518,6 +1652,29 @@ class OpinionsCited(models.Model):
     class Meta:
         verbose_name_plural = 'Opinions cited'
         unique_together = ("citing_opinion", "cited_opinion")
+
+
+class Tag(models.Model):
+    date_created = models.DateTimeField(
+        help_text="The original creation date for the item",
+        auto_now_add=True,
+        db_index=True
+    )
+    date_modified = models.DateTimeField(
+        help_text="The last moment when the item was modified. A value in "
+                  "year 1750 indicates the value is unknown",
+        auto_now=True,
+        db_index=True,
+    )
+    name = models.CharField(
+        help_text="The name of the tag.",
+        max_length=50,
+        db_index=True,
+        unique=True,
+    )
+
+    def __unicode__(self):
+        return u'%s: %s' % (self.pk, self.name)
 
 #class AppellateReview(models.Model):
 #    REVIEW_STANDARDS = (

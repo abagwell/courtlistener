@@ -1,8 +1,8 @@
 import json
-import os
 from collections import OrderedDict, defaultdict
 from datetime import date
 
+import os
 import redis
 from dateutil import parser
 from dateutil.rrule import DAILY, rrule
@@ -12,11 +12,13 @@ from django.contrib.humanize.templatetags.humanize import intcomma, ordinal
 from django.core.mail import send_mail
 from django.utils.encoding import force_text
 from django.utils.timezone import now
-from rest_framework import serializers
 from rest_framework.metadata import SimpleMetadata
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import DjangoModelPermissions
+from rest_framework.request import clone_request
 from rest_framework.throttling import UserRateThrottle
 from rest_framework_filters import RelatedFilter
+from rest_framework_filters.backends import DjangoFilterBackend
 
 from cl.lib.utils import mkdir_p
 from cl.stats.models import Event
@@ -31,26 +33,15 @@ BASIC_TEXT_LOOKUPS = ['exact', 'iexact', 'startswith', 'istartswith',
 ALL_TEXT_LOOKUPS = BASIC_TEXT_LOOKUPS + ['contains', 'icontains']
 
 
-class DynamicFieldsModelSerializer(serializers.ModelSerializer):
-    """
-    A ModelSerializer that takes an additional `fields` argument that
-    controls which fields should be displayed.
-    """
+class DisabledHTMLFilterBackend(DjangoFilterBackend):
+    """Disable showing filters in the browsable API.
 
-    def __init__(self, *args, **kwargs):
-        # Instantiate the superclass normally
-        super(DynamicFieldsModelSerializer, self).__init__(*args, **kwargs)
-        if not self.context or not self.context.get('request'):
-            # This happens during initialization.
-            return
-        fields = getattr(self.context['request'], 'query_params', {}).get('fields')
-        if fields is not None:
-            fields = fields.split(',')
-            # Drop any fields that are not specified in the `fields` argument.
-            allowed = set(fields)
-            existing = set(self.fields.keys())
-            for field_name in existing - allowed:
-                self.fields.pop(field_name)
+    Ideally, we'd want to show fields in the browsable API, but for related
+    objects this loads every object into the HTML and it loads them from the DB
+    one query at a time. It's insanity, so it's gotta be disabled globally.
+    """
+    def to_html(self, request, queryset, view):
+        return ""
 
 
 class SimpleMetadataWithFilters(SimpleMetadata):
@@ -110,6 +101,23 @@ class SimpleMetadataWithFilters(SimpleMetadata):
         if hasattr(view, 'ordering_fields'):
             metadata['ordering'] = view.ordering_fields
         return metadata
+
+    def determine_actions(self, request, view):
+        """Simple override to always show the field information even for people
+        that don't have POST access.
+
+        Fixes issue #732.
+        """
+        actions = {}
+        for method in {'PUT', 'POST'} & set(view.allowed_methods):
+            view.request = clone_request(request, method)
+            if method == 'PUT' and hasattr(view, 'get_object'):
+                view.get_object()
+            serializer = view.get_serializer()
+            actions[method] = self.get_serializer_info(serializer)
+            view.request = request
+
+        return actions
 
 
 class LoggingMixin(object):
@@ -214,21 +222,41 @@ class ExceptionalUserRateThrottle(UserRateThrottle):
         return self.throttle_success()
 
 
-class BetaUsersReadOnly(DjangoModelPermissions):
-    """Provides access beta access to users with the right permissions.
+class RECAPUsersReadOnly(DjangoModelPermissions):
+    """Provides access to users with the right permissions.
 
-    Such users must have the has_beta_api_access flag set on their account.
+    Such users must have the has_recap_api_access flag set on their account for
+    this object type.
     """
-
     perms_map = {
-        'GET': ['%(app_label)s.has_beta_api_access'],
-        'OPTIONS': ['%(app_label)s.has_beta_api_access'],
-        'HEAD': ['%(app_label)s.has_beta_api_access'],
+        'GET': ['%(app_label)s.has_recap_api_access'],
+        'OPTIONS': ['%(app_label)s.has_recap_api_access'],
+        'HEAD': ['%(app_label)s.has_recap_api_access'],
         'POST': ['%(app_label)s.add_%(model_name)s'],
         'PUT': ['%(app_label)s.change_%(model_name)s'],
         'PATCH': ['%(app_label)s.change_%(model_name)s'],
         'DELETE': ['%(app_label)s.delete_%(model_name)s'],
     }
+
+
+class RECAPUploaders(DjangoModelPermissions):
+    """Provides some users upload permissions in RECAP
+
+    Such users must have the has_recap_upload_access flag set on their account
+    """
+    perms_map = {
+        'GET': ['%(app_label)s.has_recap_upload_access'],
+        'OPTIONS': ['%(app_label)s.has_recap_upload_access'],
+        'HEAD': ['%(app_label)s.has_recap_upload_access'],
+        'POST': ['%(app_label)s.has_recap_upload_access'],
+        'PUT': ['%(app_label)s.has_recap_upload_access'],
+        'PATCH': ['%(app_label)s.has_recap_upload_access'],
+        'DELETE': ['%(app_label)s.delete_%(model_name)s'],
+    }
+
+
+class BigPagination(PageNumberPagination):
+    page_size = 300
 
 
 class BulkJsonHistory(object):

@@ -1,15 +1,17 @@
+from itertools import groupby
+
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.paginator import Paginator, PageNotAnInteger, EmptyPage
 from django.core.urlresolvers import reverse
-from django.db.models import F, Q
+from django.db.models import F, Q, Prefetch
 from django.http import HttpResponseRedirect
-from django.http.response import JsonResponse, HttpResponse, \
-    HttpResponseNotAllowed
+from django.http.response import HttpResponse, HttpResponseNotAllowed
 from django.shortcuts import get_object_or_404, render
 from django.utils.timezone import now
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import ensure_csrf_cookie
+from rest_framework.status import HTTP_404_NOT_FOUND
 
 from cl.citations.find_citations import get_citations
 from cl.custom_filters.templatetags.text_filters import best_case_name
@@ -18,17 +20,22 @@ from cl.favorites.models import Favorite
 from cl.lib import search_utils, sunburnt
 from cl.lib.bot_detector import is_bot
 from cl.lib.import_lib import map_citations_to_models
+from cl.lib.model_helpers import suppress_autotime
+from cl.lib.ratelimiter import ratelimit_if_not_whitelisted
 from cl.lib.search_utils import make_get_string
 from cl.lib.string_utils import trunc
+from cl.people_db.models import AttorneyOrganization, Role
 from cl.opinion_page.forms import CitationRedirectorForm, DocketEntryFilterForm
-from cl.search.models import Docket, OpinionCluster, DocketEntry, RECAPDocument
+from cl.search.models import Docket, OpinionCluster, RECAPDocument
 
 
-def view_docket(request, pk, _):
-    docket = get_object_or_404(Docket, pk=pk)
+@ratelimit_if_not_whitelisted
+def view_docket(request, pk, slug):
+    docket = get_object_or_404(Docket, pk=pk, slug=slug)
     if not is_bot(request):
-        docket.view_count = F('view_count') + 1
-        docket.save()
+        with suppress_autotime(docket, ['date_modified']):
+            docket.view_count = F('view_count') + 1
+            docket.save()
 
     try:
         fave = Favorite.objects.get(docket_id=docket.pk, user=request.user)
@@ -41,7 +48,7 @@ def view_docket(request, pk, _):
     else:
         favorite_form = FavoriteForm(instance=fave)
 
-    de_list = docket.docket_entries.all()
+    de_list = docket.docket_entries.all().prefetch_related('recap_documents')
     form = DocketEntryFilterForm(request.GET)
     if form.is_valid():
         cd = form.cleaned_data
@@ -56,7 +63,7 @@ def view_docket(request, pk, _):
         if cd.get('order_by') == DocketEntryFilterForm.DESCENDING:
             de_list = de_list.order_by('-entry_number')
 
-    paginator = Paginator(de_list, 500, orphans=25)
+    paginator = Paginator(de_list, 100, orphans=5)
     page = request.GET.get('page')
     try:
         docket_entries = paginator.page(page)
@@ -67,6 +74,7 @@ def view_docket(request, pk, _):
 
     return render(request, 'view_docket.html', {
         'docket': docket,
+        'parties': docket.parties.exists(),  # Needed to show/hide parties tab.
         'docket_entries': docket_entries,
         'form': form,
         'favorite_form': favorite_form,
@@ -75,6 +83,46 @@ def view_docket(request, pk, _):
     })
 
 
+@ratelimit_if_not_whitelisted
+def view_parties(request, docket_id, slug):
+    """Show the parties and attorneys tab on the docket."""
+    docket = get_object_or_404(Docket, pk=docket_id, slug=slug)
+    # We work with this data at the level of party_types so that we can group
+    # the parties by this field. From there, we do a whole mess of prefetching,
+    # which reduces the number of queries needed for this down to four instead
+    # of potentially thousands (good times!)
+    party_types = docket.party_types.select_related('party').prefetch_related(
+        Prefetch('party__roles',
+                 queryset=Role.objects.filter(
+                     docket=docket
+                 ).order_by(
+                     'attorney_id', 'role', 'date_action'
+                 ).select_related(
+                     'attorney'
+                 ).prefetch_related(
+                     Prefetch('attorney__organizations',
+                              queryset=AttorneyOrganization.objects.filter(
+                                  attorney_organization_associations__docket=docket),
+                              to_attr='firms_in_docket')
+                 ))
+    ).order_by('name', 'party__name')
+
+    parties = []
+    for party_type_name, party_types in groupby(party_types, lambda x: x.name):
+        party_types = list(party_types)
+        parties.append({
+            'party_type_name': party_type_name,
+            'party_type_objects': party_types
+        })
+
+    return render(request, 'docket_parties.html', {
+        'docket': docket,
+        'parties': parties,
+        'private': docket.blocked,
+    })
+
+
+@ratelimit_if_not_whitelisted
 def view_recap_document(request, docket_id=None, doc_num=None,  att_num=None,
                         slug=''):
     """This view can either load an attachment or a regular document,
@@ -112,42 +160,8 @@ def view_recap_document(request, docket_id=None, doc_num=None,  att_num=None,
     })
 
 
-def ajax_get_recap_documents_and_attachments(request, pk):
-    """This is the ajax view that powers the modals on the docket
-    page when a docket entry is clicked.
-    """
-    docs = DocketEntry.objects.get(pk=pk).recap_documents.all()
-
-    j = {'attachments': [], 'documents': [], 'item_count': 0}
-    for doc in docs:
-        date_upload = getattr(doc, 'date_upload', "")
-        if date_upload:
-            date_upload = date_upload.isoformat()
-
-        d = {
-            'date_upload': date_upload,
-            'document_number': doc.document_number,
-            'attachment_number': doc.attachment_number,
-            'is_available': doc.is_available,
-            'pacer_url': doc.pacer_url or '',
-            'filepath_local': doc.filepath_local.name,
-            'absolute_url': doc.get_absolute_url(),
-            'description': doc.description,
-        }
-
-        if doc.document_type == RECAPDocument.PACER_DOCUMENT:
-            j['documents'].append(d)
-        elif doc.document_type == RECAPDocument.ATTACHMENT:
-            j['attachments'].append(d)
-        j['item_count'] += 1
-
-    return JsonResponse(
-        j,
-        safe=False,
-    )
-
-
 @never_cache
+@ratelimit_if_not_whitelisted
 def view_opinion(request, pk, _):
     """Using the cluster ID, return the cluster of opinions.
 
@@ -158,10 +172,10 @@ def view_opinion(request, pk, _):
     """
     # Look up the court, cluster, title and favorite information
     cluster = get_object_or_404(OpinionCluster, pk=pk)
-    title = '%s, %s' % (
+    title = ', '.join([s for s in [
         trunc(best_case_name(cluster), 100),
         cluster.citation_string,
-    )
+    ] if s.strip()])
     has_downloads = False
     for sub_opinion in cluster.sub_opinions.all():
         if sub_opinion.local_path or sub_opinion.download_url:
@@ -207,6 +221,7 @@ def view_opinion(request, pk, _):
     })
 
 
+@ratelimit_if_not_whitelisted
 def view_authorities(request, pk, slug):
     cluster = get_object_or_404(OpinionCluster, pk=pk)
 
@@ -221,6 +236,7 @@ def view_authorities(request, pk, slug):
     })
 
 
+@ratelimit_if_not_whitelisted
 def cluster_visualizations(request, pk, slug):
     cluster = get_object_or_404(OpinionCluster, pk=pk)
     return render(request, 'view_opinion_visualizations.html', {
@@ -296,11 +312,16 @@ def citation_redirector(request, reporter=None, volume=None, page=None):
             # Show the correct page....
             if clusters.count() == 0:
                 # No results for an otherwise valid citation.
-                return render(request, 'citation_redirect_info_page.html', {
-                    'none_found': True,
-                    'citation_str': citation_str,
-                    'private': True,
-                })
+                return render(
+                    request,
+                    'citation_redirect_info_page.html',
+                    {
+                        'none_found': True,
+                        'citation_str': citation_str,
+                        'private': True,
+                    },
+                    status=HTTP_404_NOT_FOUND,
+                )
 
             elif clusters.count() == 1:
                 # Total success. Redirect to correct location.

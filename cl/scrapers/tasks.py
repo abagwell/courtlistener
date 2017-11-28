@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from __future__ import print_function
 import os
 import subprocess
 import traceback
@@ -191,6 +192,14 @@ def get_page_count(path, extension):
 
 
 @app.task
+def set_recap_page_count(rd_pk):
+    rd = RECAPDocument.objects.get(pk=rd_pk)
+    rd.page_count = get_page_count(rd.filepath_local.path, 'pdf')
+    rd.save()
+    return rd.pk
+
+
+@app.task
 def extract_doc_content(pk, callback=None, citation_countdown=0):
     """
     Given a document, we extract it, sniffing its extension, then store its
@@ -249,8 +258,8 @@ def extract_doc_content(pk, callback=None, citation_countdown=0):
             opinion.cluster.save(index=False)
             opinion.save(index=True)
     except Exception:
-        print "****Error saving text to the db for: %s****" % opinion
-        print traceback.format_exc()
+        print("****Error saving text to the db for: %s****\n%s" %
+              (opinion, traceback.format_exc()))
         return opinion
 
     # Identify and link citations within the document content
@@ -296,6 +305,7 @@ def extract_recap_pdf(pks, skip_ocr=False, check_if_needed=True):
             rd.ocr_status = RECAPDocument.OCR_UNNECESSARY
 
         rd.plain_text, _ = anonymize(content)
+        # Do not do indexing here. Creates race condition in celery.
         rd.save(index=False, do_extraction=False)
         processed.append(pk)
 
@@ -463,10 +473,9 @@ def process_audio_file(pk):
             avconv_command,
             stderr=subprocess.STDOUT
         )
-    except subprocess.CalledProcessError, e:
-        print 'avconv failed command: %s\nerror code: %s\noutput: %s\n' % \
-              (avconv_command, e.returncode, e.output)
-        print traceback.format_exc()
+    except subprocess.CalledProcessError as e:
+        print('avconv failed command: %s\nerror code: %s\noutput: %s\n%s' %
+              (avconv_command, e.returncode, e.output, traceback.format_exc()))
         raise
 
     set_mp3_meta_data(af, tmp_path)
@@ -481,7 +490,7 @@ def process_audio_file(pk):
                "process_audio_file for item: %s\n"
                "Traceback:\n"
                "%s" % (af.pk, traceback.format_exc()))
-        print msg
+        print(msg)
         ErrorLog.objects.create(log_level='CRITICAL', court=af.docket.court,
                                 message=msg)
 

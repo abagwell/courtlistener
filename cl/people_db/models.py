@@ -514,6 +514,8 @@ class Position(models.Model):
             ('a_pres', 'Appointment (President)'),
             ('a_gov', 'Appointment (Governor)'),
             ('a_legis', 'Appointment (Legislature)'),
+            # FISC appointments are made by the chief justice of SCOTUS
+            ('a_judge', 'Appointment (Judge)'),
         )),
     )
     SELECTION_METHOD_GROUPS = make_choices_group_lookup(SELECTION_METHODS)
@@ -527,6 +529,7 @@ class Position(models.Model):
         ('abolished', 'Court Abolished'),
         ('bad_judge', 'Impeached and Convicted'),
         ('recess_not_confirmed', 'Recess Appointment Not Confirmed'),
+        ('termed_out', 'Term Limit Reached'),
     )
     position_type = models.CharField(
         help_text="If this is a judicial position, this indicates the role the "
@@ -1255,12 +1258,16 @@ class Party(models.Model):
     class Meta:
         unique_together = ('name', 'extra_info')
         verbose_name_plural = "Parties"
+        permissions = (
+            ("has_recap_api_access", "Can work with RECAP API"),
+        )
 
     def __unicode__(self):
         return u'%s: %s' % (self.pk, self.name)
 
 
 class Role(models.Model):
+    """Links together the party, the attorney, and the docket"""
     ATTORNEY_TO_BE_NOTICED = 1
     ATTORNEY_LEAD = 2
     ATTORNEY_IN_SEALED_GROUP = 3
@@ -1362,6 +1369,9 @@ class Attorney(models.Model):
 
     class Meta:
         unique_together = ('name', 'contact_raw')
+        permissions = (
+            ("has_recap_api_access", "Can work with RECAP API"),
+        )
 
     def __unicode__(self):
         return u'%s: %s' % (self.pk, self.name)

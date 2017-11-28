@@ -3,8 +3,7 @@ from django.conf.urls import url
 from cl.opinion_page.sitemap import opinion_sitemap_maker, recap_sitemap_maker
 from cl.opinion_page.views import (
     view_opinion, view_authorities, view_docket, cluster_visualizations,
-    citation_redirector, view_recap_document,
-    ajax_get_recap_documents_and_attachments, block_item,
+    citation_redirector, view_recap_document, block_item, view_parties,
 )
 
 urlpatterns = [
@@ -29,6 +28,11 @@ urlpatterns = [
         name="view_docket"
     ),
     url(
+        r'^docket/(?P<docket_id>\d*)/parties/(?P<slug>[^/]*)/$',
+        view_parties,
+        name="docket_parties",
+    ),
+    url(
         r'^docket/(?P<docket_id>\d*)/(?P<doc_num>\d*)/(?P<slug>[^/]*)/$',
         view_recap_document,
         name='view_recap_document',
@@ -39,12 +43,7 @@ urlpatterns = [
         name='view_recap_attachment',
     ),
     url(
-        r'^docket-entry/(\d*)/$',
-        ajax_get_recap_documents_and_attachments,
-        name="ajax_get_recap_documents_and_attachments"
-    ),
-    url(
-        r'^c/(?:(?P<reporter>.*)/(?P<volume>\d{1,4})/(?P<page>\d{1,4})/)?$',
+        r'^c/(?:(?P<reporter>.*)/(?P<volume>\d{1,4})/(?P<page>\d{1,8})/)?$',
         citation_redirector,
         name="citation_redirector",
     ),

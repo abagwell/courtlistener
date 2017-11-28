@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
-from django.core.management import call_command
+
+import sys
 from django.db import models, migrations
 
-fixture = 'bar_membership_data'
+from cl.lib.migration_utils import load_migration_fixture
 
 
 def load_fixture(apps, schema_editor):
-    call_command('loaddata', fixture, app_label='users')
+    if 'test' in sys.argv:
+        fixture = 'bar_membership_data_truncated'
+    else:
+        fixture = 'bar_membership_data'
+    load_migration_fixture(apps, schema_editor, fixture, 'users')
 
 
 def unload_fixture(apps, schema_editor):

@@ -6,7 +6,7 @@ try:
     import mx.DateTime
 except ImportError:
     warnings.warn(
-        "mx.DateTime not found, retricted to Python datetime objects",
+        "mx.DateTime not found, restricted to Python datetime objects",
         ImportWarning)
     mx = None
 
@@ -85,7 +85,7 @@ else:
             kwargs['microsecond'] = int(f * 1000000)
         try:
             return datetime.datetime(**kwargs)
-        except ValueError, e:
+        except ValueError as e:
             raise DateTimeRangeError(e.args[0])
 
 if mx:

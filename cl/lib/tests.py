@@ -1,22 +1,84 @@
 # coding=utf8
-"""
-Unit tests for lib
-"""
-import datetime
+from __future__ import print_function
 
+import datetime
+import re
+
+import os
+import tempfile
+
+from django.core.files.base import ContentFile
 from django.core.urlresolvers import reverse
-from django.test import TestCase
+from django.test import TestCase, SimpleTestCase
 from django.test import override_settings
 from rest_framework.status import HTTP_503_SERVICE_UNAVAILABLE, HTTP_200_OK
 
+from cl.lib.db_tools import queryset_generator
 from cl.lib.mime_types import lookup_mime_type
 from cl.lib.model_helpers import make_upload_path
-from cl.lib.pacer import normalize_party_types, normalize_attorney_role, \
-    normalize_attorney_contact, normalize_us_state, make_address_lookup_key
+from cl.lib.pacer import normalize_attorney_role, normalize_attorney_contact,\
+    normalize_us_state, make_address_lookup_key
 from cl.lib.search_utils import make_fq
+from cl.lib.storage import UUIDFileSystemStorage
 from cl.lib.string_utils import trunc
 from cl.people_db.models import Role
+from cl.scrapers.models import UrlHash
 from cl.search.models import Opinion, OpinionCluster, Docket, Court
+
+
+class TestDBTools(TestCase):
+    # This fixture uses UrlHash objects b/c they've been around a long while and
+    # are wickedly simple objects.
+    fixtures = ['test_queryset_generator.json']
+
+    def test_queryset_generator(self):
+        """Does the generator work properly with a variety of queries?"""
+        tests = [
+            {'query': UrlHash.objects.filter(pk__in=['BAD ID']),
+             'count': 0},
+            {'query': UrlHash.objects.filter(pk__in=['0']),
+             'count': 1},
+            {'query': UrlHash.objects.filter(pk__in=['0', '1']),
+             'count': 2},
+        ]
+        for test in tests:
+            print("Testing queryset_generator with %s expected results..." %
+                  test['count'], end='')
+            count = 0
+            for _ in queryset_generator(test['query']):
+                count += 1
+            self.assertEqual(count, test['count'])
+            print('✓')
+
+    def test_queryset_generator_values_query(self):
+        """Do values queries work?"""
+        print("Testing raising an error when we can't get a PK in a values "
+              "query...", end='')
+        self.assertRaises(
+            Exception,
+            queryset_generator(UrlHash.objects.values('sha1')),
+            msg="Values query did not fail when pk was not provided."
+        )
+        print('✓')
+
+        print("Testing a good values query...", end='')
+        self.assertEqual(
+            sum(1 for _ in queryset_generator(UrlHash.objects.values())),
+            2,
+        )
+        print('✓')
+
+    def test_queryset_generator_chunking(self):
+        """Does chunking work properly without duplicates or omissions?"""
+        print("Testing if queryset_iterator chunking returns the right "
+              "number of results...", end='')
+        expected_count = 2
+        results = queryset_generator(UrlHash.objects.all(), chunksize=1)
+        self.assertEqual(
+            expected_count,
+            sum(1 for _ in results),
+        )
+        print('✓')
 
 
 class TestStringUtils(TestCase):
@@ -105,6 +167,28 @@ class TestModelHelpers(TestCase):
         self.assertEqual(expected, path)
 
 
+class UUIDFileSystemStorageTest(SimpleTestCase):
+    # Borrows from https://github.com/django/django/blob/9cbf48693dcd8df6cb22c183dcc94e7ce62b2921/tests/file_storage/tests.py#L89
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.storage = UUIDFileSystemStorage(location=self.temp_dir,
+                                             base_url='test_uuid_storage')
+
+    def test_file_save_with_path(self):
+        """Does saving a pathname create directories and filenames correctly?"""
+        self.assertFalse(self.storage.exists('path/to'))
+        file_name = 'filename'
+        extension = 'ext'
+        f = self.storage.save('path/to/%s.%s' % (file_name, extension),
+                              ContentFile('file with path'))
+        self.assertTrue(self.storage.exists('path/to'))
+        dir_name_created, file_name_created = os.path.split(f)
+        file_root_created, extension_created = file_name_created.split('.', 1)
+        self.assertEqual(extension_created, extension)
+        self.assertTrue(re.match('[a-f0-9]{32}', file_root_created))
+
+
 class TestMimeLookup(TestCase):
     """ Test the Mime type lookup function(s)"""
 
@@ -162,60 +246,6 @@ class TestMaintenanceMiddleware(TestCase):
 class TestPACERPartyParsing(TestCase):
     """Various tests for the PACER party parsers."""
 
-    def test_party_type_normalization(self):
-        pairs = [{
-            'q': 'Defendant                                 (1)',
-            'a': 'Defendant'
-        }, {
-            'q': 'Debtor 2',
-            'a': 'Debtor',
-        }, {
-            'q': 'ThirdParty Defendant',
-            'a': 'Third Party Defendant',
-        }, {
-            'q': 'ThirdParty Plaintiff',
-            'a': 'Third Party Plaintiff',
-        }, {
-            'q': '3rd Pty Defendant',
-            'a': 'Third Party Defendant',
-        }, {
-            'q': '3rd party defendant',
-            'a': 'Third Party Defendant',
-        }, {
-            'q': 'Counter-defendant',
-            'a': 'Counter Defendant',
-        }, {
-            'q': 'Counter-Claimaint',
-            'a': 'Counter Claimaint',
-        }, {
-            'q': 'US Trustee',
-            'a': 'U.S. Trustee',
-        }, {
-            'q': 'United States Trustee',
-            'a': 'U.S. Trustee',
-        }, {
-            'q': 'U. S. Trustee',
-            'a': 'U.S. Trustee',
-        }, {
-            'q': 'BUS BOY',
-            'a': 'Bus Boy',
-        }, {
-            'q': 'JointAdmin Debtor',
-            'a': 'Jointly Administered Debtor',
-        }, {
-            'q': 'Intervenor-Plaintiff',
-            'a': 'Intervenor Plaintiff',
-        }, {
-            'q': 'Intervenor Dft',
-            'a': 'Intervenor Defendant',
-        }]
-        for pair in pairs:
-            print "Normalizing PACER type of '%s' to '%s'..." % \
-                  (pair['q'], pair['a']),
-            result = normalize_party_types(pair['q'])
-            self.assertEqual(result, pair['a'])
-            print '✓'
-
     def test_attorney_role_normalization(self):
         """Can we normalize the attorney roles into a small number of roles?"""
         pairs = [{
@@ -257,11 +287,11 @@ class TestPACERPartyParsing(TestCase):
                   'date_action': datetime.date(2007, 1, 1)},
         }]
         for pair in pairs:
-            print "Normalizing PACER role of '%s' to '%s'..." % \
-                  (pair['q'], pair['a']),
+            print("Normalizing PACER role of '%s' to '%s'..." %
+                  (pair['q'], pair['a']), end='')
             result = normalize_attorney_role(pair['q'])
             self.assertEqual(result, pair['a'])
-            print '✓'
+            print('✓')
         with self.assertRaises(ValueError):
             normalize_attorney_role('this is an unknown role')
 
@@ -280,11 +310,11 @@ class TestPACERPartyParsing(TestCase):
             'a': 'CA',
         }]
         for pair in pairs:
-            print "Normalizing state of '%s' to '%s'..." % \
-                  (pair['q'], pair['a']),
+            print("Normalizing state of '%s' to '%s'..." %
+                  (pair['q'], pair['a']), end='')
             result = normalize_us_state(pair['q'])
             self.assertEqual(result, pair['a'])
-            print '✓'
+            print('✓')
 
     def test_normalize_atty_contact(self):
         pairs = [{
@@ -304,7 +334,7 @@ class TestPACERPartyParsing(TestCase):
                 'lookup_key': u'701westeighthavesuite1200anchoragelandyebennettblumsteinak99501',
             }, {
                 'email': u'brucem@lbblawyers.com',
-                'phone': u'907-276-5152',
+                'phone': u'(907) 276-5152',
                 'fax': u'',
             })
         }, {
@@ -321,7 +351,7 @@ class TestPACERPartyParsing(TestCase):
                 'zip_code': u'23218-2188',
                 'lookup_key': u'pobox2188richmondsandsandersonva232182188',
             }, {
-                'phone': u'804648-1636',
+                'phone': u'(804) 648-1636',
                 'fax': u'',
                 'email': u'',
             })
@@ -339,7 +369,7 @@ class TestPACERPartyParsing(TestCase):
                 'zip_code': u'23218-2188',
                 'lookup_key': u'pobox2188richmondsandsandersonva232182188',
             }, {
-                'phone': u"804648-1636",
+                'phone': u"(804) 648-1636",
                 'fax': u'',
                 'email': u'',
             })
@@ -360,8 +390,8 @@ class TestPACERPartyParsing(TestCase):
                 'zip_code': u'98101',
                 'lookup_key': u'1201thirdavesuite3800seattlesusmangodfreywa98101',
             }, {
-                'phone': u'206-373-7381',
-                'fax': u'206-516-3883',
+                'phone': u'(206) 373-7381',
+                'fax': u'(206) 516-3883',
                 'email': u'fshort@susmangodfrey.com',
             })
         }, {
@@ -377,7 +407,7 @@ class TestPACERPartyParsing(TestCase):
                 'zip_code': u'43215',
                 'lookup_key': u'211elivingstonavecolumbusoh43215',
             }, {
-                'phone': u'614228-3727',
+                'phone': u'(614) 228-3727',
                 'email': u'',
                 'fax': u'',
             }),
@@ -398,8 +428,8 @@ class TestPACERPartyParsing(TestCase):
                 'zip_code': u'25301',
                 'lookup_key': u'1018kanawhablvde1200blvdtowercharlestonwv25301',
             }, {
-                'phone': '304342-3174',
-                'fax': '304342-0448',
+                'phone': '(304) 342-3174',
+                'fax': '(304) 342-0448',
                 'email': 'caglelaw@aol.com',
             })
         }, {
@@ -419,7 +449,7 @@ class TestPACERPartyParsing(TestCase):
                 'zip_code': u'80203',
                 'lookup_key': u'303e17thavesuite300denverco80203',
             }, {
-                'phone': u'303-861-1764',
+                'phone': u'(303) 861-1764',
                 'fax': u'',
                 'email': u'jeff@dyerberens.com',
             })
@@ -442,7 +472,7 @@ class TestPACERPartyParsing(TestCase):
                 'lookup_key': u'106southmentorave150pasadenaguerrinilawfirmca91106',
             }, {
                 'phone': u'',
-                'fax': u'626-229-9615',
+                'fax': u'(626) 229-9615',
                 'email': u'guerrini@guerrinilaw.com',
             })
         }, {
@@ -475,7 +505,7 @@ class TestPACERPartyParsing(TestCase):
                     Email: darden@carverdarden.com
                 """,
             'a': ({}, {
-                'phone': u'504-585-3800',
+                'phone': u'(504) 585-3800',
                 'email': u'darden@carverdarden.com',
                 'fax': u'',
             })
@@ -514,17 +544,17 @@ class TestPACERPartyParsing(TestCase):
                 'state': u'',
                 'zip_code': u'19087'
             }, {
-                'phone': u'610667-7706',
-                'fax': u'610667-7056',
+                'phone': u'(610) 667-7706',
+                'fax': u'(610) 667-7056',
                 'email': u'jneumann@ktmc.com'
             })
         }]
         for i, pair in enumerate(pairs):
-            print "Normalizing address %s..." % i,
+            print("Normalizing address %s..." % i, end='')
             result = normalize_attorney_contact(pair['q'])
             self.maxDiff = None
             self.assertEqual(result, pair['a'])
-            print '✓'
+            print('✓')
 
     def test_making_a_lookup_key(self):
         self.assertEqual(

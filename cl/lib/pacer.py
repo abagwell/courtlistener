@@ -13,12 +13,13 @@ from django.db import IntegrityError
 from django.db import transaction
 from django.db.models import Q
 from juriscraper.lib.string_utils import CaseNameTweaker, harmonize, titlecase
+from juriscraper.lib.exceptions import ParsingException
+from juriscraper.pacer.docket_utils import normalize_party_types
 from localflavor.us.forms import phone_digits_re
 from localflavor.us.us_states import STATES_NORMALIZED, USPS_CHOICES
 from lxml import etree
 
-from cl.corpus_importer.import_columbia.parse_judges import find_judge_names
-from cl.lib.import_lib import find_person
+from cl.lib.import_lib import get_candidate_judges
 from cl.lib.recap_utils import (
     get_docketxml_url_from_path, get_ia_document_url_from_path,
     get_local_document_url_from_path,
@@ -65,23 +66,46 @@ def lookup_and_save(new, debug=False):
     Returns None if an error occurs, else, return the new or updated Docket.
     """
     try:
-        d = Docket.objects.get(
-            Q(pacer_case_id=new.pacer_case_id) |
-            Q(docket_number=new.docket_number),
-            court=new.court,
-        )
-        # Add RECAP as a source if it's not already.
-        if d.source in [Docket.DEFAULT, Docket.SCRAPER]:
-            d.source = Docket.RECAP_AND_SCRAPER
-        elif d.source == Docket.COLUMBIA:
-            d.source = Docket.COLUMBIA_AND_RECAP
-        elif d.source == Docket.COLUMBIA_AND_SCRAPER:
-            d.source = Docket.COLUMBIA_AND_RECAP_AND_SCRAPER
-    except Docket.DoesNotExist:
-        d = Docket(source=Docket.RECAP)
-    except Docket.MultipleObjectsReturned:
-        logger.error("Got multiple results while attempting save.")
-        return None
+        d = Docket.objects.get(pacer_case_id=new.pacer_case_id,
+                               court=new.court)
+    except (Docket.DoesNotExist, Docket.MultipleObjectsReturned):
+        d = None
+
+    if d is None:
+        ds = Docket.objects.filter(docket_number=new.docket_number,
+                                   court=new.court).order_by('-date_filed')
+        count = ds.count()
+        if count < 1:
+            # Can't find it by pacer_case_id or docket_number. Make a new item.
+            d = Docket(source=Docket.RECAP)
+        elif count == 1:
+            # Nailed it!
+            d = ds[0]
+        elif count > 1:
+            # Too many dockets returned. Disambiguate.
+            logger.error("Got multiple results while attempting save.")
+
+            def is_different(x):
+                return x.pacer_case_id and x.pacer_case_id != new.pacer_case_id
+            if all([is_different(d) for d in ds]):
+                # All the dockets found match on docket number, but have
+                # different pacer_case_ids. This means that the docket has
+                # multiple pacer_case_ids in PACER, and we should mirror that
+                # in CL by creating a new docket for the new item.
+                d = Docket(source=Docket.RECAP)
+            else:
+                # Just use the most recent docket. Looking at the data, this is
+                # OK. Nearly all of these are dockets associated with clusters
+                # that can be merged (however, that's a project for clusters).
+                d = ds[0]
+
+    # Add RECAP as a source if it's not already.
+    if d.source in [Docket.DEFAULT, Docket.SCRAPER]:
+        d.source = Docket.RECAP_AND_SCRAPER
+    elif d.source == Docket.COLUMBIA:
+        d.source = Docket.COLUMBIA_AND_RECAP
+    elif d.source == Docket.COLUMBIA_AND_SCRAPER:
+        d.source = Docket.COLUMBIA_AND_RECAP_AND_SCRAPER
 
     for attr, v in new.__dict__.items():
         setattr(d, attr, v)
@@ -91,6 +115,36 @@ def lookup_and_save(new, debug=False):
         logger.info("Saved as Docket %s: https://www.courtlistener.com%s" %
                     (d.pk, d.get_absolute_url()))
     return d
+
+
+def get_first_missing_de_number(d):
+    """When buying dockets use this function to figure out which docket entries
+    we already have, starting at the first item. Since PACER only allows you to
+    do a range of docket entries, this allows us to figure out a later starting
+    point for our query.
+
+    For example, if we have documents 1-32 already in the DB, we can save some
+    money by only getting items 33 and on.
+
+    :param d: The Docket object to check.
+    :returns int: The starting point that should be used in your query. If the
+    docket has no entries, returns 1. If the docket has entries, returns the
+    value of the lowest missing item.
+    """
+    de_numbers = list(d.docket_entries.all().order_by(
+        'entry_number'
+    ).values_list('entry_number', flat=True))
+
+    if len(de_numbers) > 0:
+        # Get the earliest missing item
+        end = de_numbers[-1]
+        missing_items = sorted(set(range(1, end + 1)).difference(de_numbers))
+        if missing_items:
+            return missing_items[0]
+        else:
+            # None missing, but we can start after the highest de we know.
+            return end + 1
+    return 1
 
 
 def get_blocked_status(docket, count_override=None):
@@ -115,19 +169,20 @@ def get_blocked_status(docket, count_override=None):
     whether the item should be private. The second is the date of the privacy
     decision (today) or None if the item should not be private.
     """
+    if getattr(docket, 'blocked', False):
+        # Short circuit. This function can only make things blocked that were
+        # previously public.
+        return docket.blocked, docket.date_blocked
+
     bankruptcy_privacy_threshold = 500
     if count_override is not None:
         count = count_override
     else:
         count = docket.docket_entries.all().count()
     small_case = count <= bankruptcy_privacy_threshold
-    if all([small_case, docket.court.is_bankruptcy]):
+    if all([small_case, docket.court in Court.BANKRUPTCY_JURISDICTIONS]):
         return True, date.today()
     return False, None
-
-
-class ParsingException(Exception):
-    pass
 
 
 class PacerXMLParser(object):
@@ -256,8 +311,7 @@ class PacerXMLParser(object):
                 try:
                     if not debug:
                         docket_entry.save()
-                except (IntegrityError,
-                        DocketEntry.MultipleObjectsReturned):
+                except (IntegrityError, DocketEntry.MultipleObjectsReturned):
                     logger.error("Unable to create docket entry for docket "
                                  "#%s, on entry: %s." % (docket, entry_number))
                     continue
@@ -281,58 +335,60 @@ class PacerXMLParser(object):
         pacer_document_id = self.get_str_from_node(
             doc_node, 'pacer_doc_id')
         try:
-            d = RECAPDocument.objects.get(
+            rd = RECAPDocument.objects.get(
                 docket_entry=docket_entry,
                 document_number=entry_number,
                 # Use the attachment number if it is not 0, else use None.
                 attachment_number=attachment_number or None,
             )
         except RECAPDocument.DoesNotExist:
-            d = RECAPDocument(
+            rd = RECAPDocument(
                 docket_entry=docket_entry,
                 pacer_doc_id=pacer_document_id,
                 document_number=entry_number,
             )
         else:
-            d.pacer_doc_id = pacer_document_id or d.pacer_doc_id
+            rd.pacer_doc_id = pacer_document_id or rd.pacer_doc_id
 
-        d.date_upload = self.get_datetime_from_node(doc_node, 'upload_date')
-        d.document_type = document_type or d.document_type
+        rd.date_upload = self.get_datetime_from_node(doc_node, 'upload_date')
+        rd.document_type = document_type or rd.document_type
 
-        # If we can't parse the availability node (it returns None), default it
-        # to False.
-        availability = self.get_bool_from_node(doc_node, 'available')
-        d.is_available = False if availability is None else availability
-        d.sha1 = self.get_str_from_node(doc_node, 'sha1')
-        d.description = (self.get_str_from_node(doc_node, 'short_desc') or
-                         d.description)
-        if d.is_available:
-            d.filepath_ia = get_ia_document_url_from_path(
+        if not rd.is_available:
+            # If we can't parse the availability node (it returns None),
+            # default it to False.
+            availability = self.get_bool_from_node(doc_node, 'available')
+            rd.is_available = False if availability is None else availability
+        if not rd.sha1:
+            rd.sha1 = self.get_str_from_node(doc_node, 'sha1')
+        rd.description = (self.get_str_from_node(doc_node, 'short_desc') or
+                          rd.description)
+        if rd.is_available:
+            rd.filepath_ia = get_ia_document_url_from_path(
                 self.path, entry_number, attachment_number)
-            d.filepath_local = os.path.join(
+            rd.filepath_local = os.path.join(
                 'recap',
                 get_local_document_url_from_path(self.path, entry_number,
                                                  attachment_number),
             )
-            if d.page_count is None:
-                extension = d.filepath_local.path.split('.')[-1]
-                d.page_count = get_page_count(d.filepath_local.path, extension)
+            if rd.page_count is None:
+                extension = rd.filepath_local.path.split('.')[-1]
+                rd.page_count = get_page_count(rd.filepath_local.path, extension)
         if document_type == RECAPDocument.ATTACHMENT:
-            d.attachment_number = attachment_number
+            rd.attachment_number = attachment_number
         if not debug:
             try:
-                d.save(do_extraction=False, index=False)
+                rd.save(do_extraction=False, index=False)
             except IntegrityError as e:
                 # This happens when a pacer_doc_id has been wrongly set as
                 # the document_number, see for example, document 19 and
                 # document 00405193374 here: https://ia802300.us.archive.org/23/items/gov.uscourts.ca4.14-1872/gov.uscourts.ca4.14-1872.docket.xml
                 logger.error("Unable to create RECAPDocument for document #%s, "
                              "attachment #%s on entry: %s due to "
-                             "IntegrityError." % (d.document_number,
-                                                  d.attachment_number,
-                                                  d.docket_entry))
+                             "IntegrityError." % (rd.document_number,
+                                                  rd.attachment_number,
+                                                  rd.docket_entry))
                 return None
-        return d
+        return rd
 
     @transaction.atomic
     def make_parties(self, docket, debug):
@@ -354,11 +410,14 @@ class PacerXMLParser(object):
                     extra_info=party_extra_info,
                 )
                 if not debug:
-                    party.save()
-            else:
-                if party_extra_info and not debug:
-                    party.extra_info = party_extra_info
-                    party.save()
+                    try:
+                        party.save()
+                    except IntegrityError:
+                        party = Party.objects.get(name=party_name)
+
+            if party_extra_info and not debug:
+                party.extra_info = party_extra_info
+                party.save()
 
             # If the party type doesn't exist, make a new one.
             if not party.party_types.filter(docket=docket,
@@ -579,48 +638,13 @@ class PacerXMLParser(object):
             logger.info("Couldn't get judge for node: %s" % node)
             return None, ''
         else:
-            judge_names = find_judge_names(s)
-            judges = []
-            for judge_name in judge_names:
-                judges.append(find_person(judge_name, self.court.pk,
-                                          case_date=self.date_filed))
-            judges = [c for c in judges if c is not None]
+            judges = get_candidate_judges(s, self.court.pk, self.date_filed)
             if len(judges) == 0:
-                logger.info("No judge for: %s" % (
-                    (s, self.court.pk, self.date_filed),
-                ))
                 return None, s
             elif len(judges) == 1:
                 return judges[0], s
-            elif len(judges) > 1:
-                logger.info("Too many judges found: %s" % len(judges))
+            else:
                 return None, s
-
-
-def normalize_party_types(t):
-    """Normalize various party types to as few as possible."""
-    t = t.lower()
-
-    # Numerical types
-    t = re.sub(r'defendant\s+\(\d+\)', r'defendant', t)
-    t = re.sub(r'debtor\s+\d+', 'debtor', t)
-
-    # Assorted other
-    t = re.sub(r'(thirdparty|3rd pty|3rd party)', r'third party', t)
-    t = re.sub(r'(fourthparty|4th pty|4th party)', r'fourth party', t)
-    t = re.sub(r'counter-(defendant|claimaint)', r'counter \1', t)
-    t = re.sub(r'\bus\b', 'u.s.', t)
-    t = re.sub(r'u\. s\.', 'u.s.', t)
-    t = re.sub(r'united states', 'u.s.', t)
-    t = re.sub(r'jointadmin', 'jointly administered', t)
-    t = re.sub(r'consolidated-debtor', 'consolidated debtor', t)
-    t = re.sub(r'plaintiff-? consolidated', 'consolidated plaintiff', t)
-    t = re.sub(r'defendant-? consolidated', 'consolidated defendant', t)
-    t = re.sub(r'intervenor-plaintiff', 'intervenor plaintiff', t)
-    t = re.sub(r'intervenor pla\b', 'intervenor plaintiff', t)
-    t = re.sub(r'intervenor dft\b', 'intervenor defendant', t)
-
-    return titlecase(t)
 
 
 def normalize_attorney_role(r):
@@ -661,6 +685,15 @@ def normalize_attorney_role(r):
         raise ValueError(u"Unable to match role: %s" % r)
     else:
         return role
+
+
+def normalize_us_phone_number(phone):
+    """Tidy up phone numbers so they're nice."""
+    phone = re.sub('(\(|\)|\s+)', '', phone)
+    m = phone_digits_re.search(phone)
+    if m:
+        return '(%s) %s-%s' % (m.group(1), m.group(2), m.group(3))
+    return ''
 
 
 def normalize_us_state(state):
@@ -790,12 +823,12 @@ def normalize_attorney_contact(c, fallback_name=''):
             clean_line = re.sub('Fax:', '', clean_line)
             m = phone_digits_re.search(clean_line)
             if m:
-                atty_info['fax'] = clean_line
+                atty_info['fax'] = normalize_us_phone_number(clean_line)
             continue
         else:
             m = phone_digits_re.search(clean_line)
             if m:
-                atty_info['phone'] = clean_line
+                atty_info['phone'] = normalize_us_phone_number(clean_line)
                 continue
 
         # First line containing an ampersand? These are usually law firm names.

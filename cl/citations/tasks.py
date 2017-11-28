@@ -1,4 +1,5 @@
 import re
+from httplib import ResponseNotReady
 
 from cl.celery import app
 from cl.citations import find_citations, match_citations
@@ -8,6 +9,7 @@ from cl.search.models import Opinion, OpinionsCited
 # are considered parallel reporters. For example, "22 U.S. 44, 46 (13 Atl. 33)"
 # would have a distance of 4.
 PARALLEL_DISTANCE = 4
+
 
 @app.task
 def identify_parallel_citations(citations):
@@ -79,8 +81,8 @@ def create_cited_html(opinion, citations):
     return new_html.encode('utf-8')
 
 
-@app.task
-def update_document(opinion, index=True):
+@app.task(bind=True, max_retries=5, ignore_result=True)
+def update_document(self, opinion, index=True):
     """Get the citations for an item and save it and add it to the index if
     requested."""
     citations = get_document_citations(opinion)
@@ -88,10 +90,14 @@ def update_document(opinion, index=True):
     # List used so we can do one simple update to the citing opinion.
     opinions_cited = set()
     for citation in citations:
-        matches = match_citations.match_citation(
-            citation,
-            citing_doc=opinion
-        )
+        try:
+            matches = match_citations.match_citation(
+                citation,
+                citing_doc=opinion
+            )
+        except ResponseNotReady as e:
+            # Threading problem in httplib, which is used in the Solr query.
+            raise self.retry(exc=e, countdown=2)
 
         # TODO: Figure out what to do if there's more than one
         if len(matches) == 1:
@@ -142,8 +148,7 @@ def update_document(opinion, index=True):
     opinion.save(index=index)
 
 
-@app.task
-def update_document_by_id(opinion_id):
-    """This is not an OK way to do id-based tasks. Needs to be refactored."""
+@app.task(ignore_result=True)
+def update_document_by_id(opinion_id, index=True):
     op = Opinion.objects.get(pk=opinion_id)
-    update_document(op)
+    update_document(op, index=index)

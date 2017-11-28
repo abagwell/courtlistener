@@ -54,8 +54,8 @@ def get_local_document_url_from_path(path, document_number, attachment_number):
     bucket = '.'.join(filename.split('.')[0:4])
     return "{bucket}.{doc_num}.{att_num}.pdf".format(
         bucket=bucket,
-        att_num=attachment_number,
         doc_num=document_number,
+        att_num=attachment_number,
     )
 
 
@@ -75,7 +75,8 @@ def get_docket_filename(court, pacer_case_id):
 def get_document_filename(court, pacer_case_id, document_number,
                           attachment_number):
     return ".".join(["gov", "uscourts", unicode(court), unicode(pacer_case_id),
-                     unicode(document_number), unicode(attachment_number), "pdf"])
+                     unicode(document_number), unicode(attachment_number or 0),
+                     "pdf"])
 
 
 def needs_ocr(content):

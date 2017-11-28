@@ -1,8 +1,8 @@
 import datetime
-import os
 import re
 import sys
 
+import os
 from django.contrib.messages import constants as message_constants
 from judge_pics import judge_root
 
@@ -58,6 +58,7 @@ MIDDLEWARE_CLASSES = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
+    'ratelimit.middleware.RatelimitMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'cl.lib.middleware.MaintenanceModeMiddleware',
 ]
@@ -80,7 +81,7 @@ INSTALLED_APPS = [
     'mathfilters',
     'rest_framework',
     'rest_framework.authtoken',
-    'crispy_forms',  # For DRF HTML site.
+    'rest_framework_swagger',
     'django_filters',
 
     # CourtListener Apps
@@ -96,6 +97,7 @@ INSTALLED_APPS = [
     'cl.people_db',
     'cl.lib',
     'cl.opinion_page',
+    'cl.recap',
     'cl.scrapers',
     'cl.search',
     'cl.simple_pages',
@@ -183,6 +185,7 @@ else:
                                                   REDIS_DATABASES['CELERY'])
     CELERYD_CONCURRENCY = 20
     BROKER_POOL_LIMIT = 30
+    CELERY_TASK_RESULT_EXPIRES = 3600
     BROKER_TRANSPORT_OPTIONS = {
         # This is the length of time a task will wait to be acknowledged by a
         # worker. This value *must* be greater than the largest ETA/countdown
@@ -223,6 +226,7 @@ SERVER_EMAIL = 'CourtListener <noreply@courtlistener.com>'
 DEFAULT_FROM_EMAIL = 'CourtListener <noreply@courtlistener.com>'
 SCRAPER_ADMINS = (
     ('Slack Juriscraper Channel', 'j9f4b5n5x7k8x2r1@flp-talk.slack.com'),
+    ('PA', 'arderyp@protonmail.com'),
 )
 
 ###############
@@ -289,6 +293,7 @@ REST_FRAMEWORK = {
         'gpilapil': '10000/hour',
         'peidelman': '20000/hour',
         'waldo': '10000/hour',
+        'hdave4': '15000/hour',  # GSU
     },
 
     # Auth
@@ -313,7 +318,7 @@ REST_FRAMEWORK = {
 
     # Filtering
     'DEFAULT_FILTER_BACKENDS': (
-        'rest_framework.filters.DjangoFilterBackend',
+        'cl.api.utils.DisabledHTMLFilterBackend',
         'rest_framework.filters.OrderingFilter',
     ),
 
@@ -322,6 +327,8 @@ REST_FRAMEWORK = {
     'URL_FIELD_NAME': 'resource_uri',
     'DEFAULT_METADATA_CLASS': 'cl.api.utils.SimpleMetadataWithFilters',
     'ORDERING_PARAM': 'order_by',
+    'HTML_SELECT_CUTOFF': 100,
+    'UPLOADED_FILES_USE_URL': False,
 }
 
 if DEVELOPMENT:
@@ -369,6 +376,7 @@ SCDB_LATEST_CASE = datetime.datetime(2016, 6, 27)
 ######################
 # Various and Sundry #
 ######################
+RATELIMIT_VIEW = 'cl.simple_pages.views.ratelimited'
 if DEVELOPMENT:
     SESSION_COOKIE_SECURE = False
     CSRF_COOKIE_SECURE = False

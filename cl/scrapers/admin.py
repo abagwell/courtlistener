@@ -1,6 +1,7 @@
 from django.contrib import admin
 
-from cl.scrapers.models import UrlHash, ErrorLog, RECAPLog, PACERFreeDocumentLog
+from cl.scrapers.models import UrlHash, ErrorLog, RECAPLog, \
+    PACERFreeDocumentLog, PACERFreeDocumentRow
 
 
 @admin.register(ErrorLog)
@@ -27,5 +28,10 @@ class PACERFreeDocumentLogAdmin(admin.ModelAdmin):
     list_editable = ('status',)
     ordering = ('-date_started',)
 
+
+@admin.register(PACERFreeDocumentRow)
+class PACERFreeDocumentRowAdmin(admin.ModelAdmin):
+    list_display = ('__str__', 'court_id', 'docket_number', 'error_msg')
+    list_filter = ('court_id',)
 
 admin.site.register(UrlHash)

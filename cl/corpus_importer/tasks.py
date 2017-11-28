@@ -9,23 +9,35 @@ import internetarchive as ia
 import requests
 from django.conf import settings
 from django.core.files.base import ContentFile
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction, DatabaseError
+from django.db.models import Q
 from django.utils.encoding import force_bytes
 from django.utils.timezone import now
 from juriscraper.lib.string_utils import harmonize
-from juriscraper.pacer import FreeOpinionReport
-from requests.exceptions import ChunkedEncodingError, HTTPError, ConnectionError
+from juriscraper.pacer import FreeOpinionReport, PossibleCaseNumberApi, \
+    DocketReport, AttachmentPage
+from pyexpat import ExpatError
+from requests.exceptions import ChunkedEncodingError, HTTPError, \
+    ConnectionError, ReadTimeout, ConnectTimeout
 from requests.packages.urllib3.exceptions import ReadTimeoutError
-
-from rest_framework.status import HTTP_403_FORBIDDEN
+from rest_framework.status import (
+    HTTP_400_BAD_REQUEST,
+    HTTP_403_FORBIDDEN,
+    HTTP_500_INTERNAL_SERVER_ERROR,
+    HTTP_504_GATEWAY_TIMEOUT,
+)
 
 from cl.celery import app
+from cl.custom_filters.templatetags.text_filters import best_case_name
 from cl.lib.pacer import PacerXMLParser, lookup_and_save, get_blocked_status, \
-    map_pacer_to_cl_id
+    map_pacer_to_cl_id, map_cl_to_pacer_id, get_first_missing_de_number
 from cl.lib.recap_utils import get_document_filename, get_bucket_name
-from cl.scrapers.models import PACERFreeDocumentLog
+from cl.recap.models import FjcIntegratedDatabase, PacerHtmlFiles
+from cl.recap.tasks import update_docket_metadata, add_parties_and_attorneys
+from cl.scrapers.models import PACERFreeDocumentLog, PACERFreeDocumentRow
 from cl.scrapers.tasks import get_page_count, extract_recap_pdf
-from cl.search.models import DocketEntry, RECAPDocument
+from cl.search.tasks import add_or_update_recap_document
+from cl.search.models import DocketEntry, RECAPDocument, Court, Docket, Tag
 
 logger = logging.getLogger(__name__)
 
@@ -98,75 +110,181 @@ def get_free_document_report(self, court_id, start, end, session):
     """Get structured results from the PACER free document report"""
     report = FreeOpinionReport(court_id, session)
     try:
-        responses = report.query(start, end, sort='case_number')
-    except (ConnectionError, ChunkedEncodingError) as exc:
+        report.query(start, end, sort='case_number')
+    except (ConnectionError, ChunkedEncodingError, ReadTimeoutError,
+            ConnectTimeout, HTTPError) as exc:
         logger.warning("Unable to get free document report results from %s "
                        "(%s to %s). Trying again." % (court_id, start, end))
         raise self.retry(exc=exc, countdown=5)
-    else:
-        return report.parse(responses)
+
+    try:
+        return report.data
+    except IndexError as exc:
+        # Happens when the page isn't downloaded properly, ugh.
+        raise self.retry(exc=exc, countdown=15)
 
 
-@app.task(bind=True, max_retries=5)
-def process_free_opinion_result(self, result, court, cnt, pacer_court_id,
-                                next_end_date):
-    """Process a single result from the free opinion report"""
-    result.court = court
-    result.case_name = harmonize(result.case_name)
-    result.case_name_short = cnt.make_case_name_short(result.case_name)
-    result_copy = copy.copy(result)
-    # If we don't do this, the doc's date_filed becomes the docket's
-    # date_filed. Bad.
-    delattr(result_copy, 'date_filed')
-    # If we don't do this, we get the PACER court id and it crashes
-    delattr(result_copy, 'court_id')
-    docket = lookup_and_save(result_copy)
-    if not docket:
-        logger.error("Unable to create docket for %s" % result)
-        self.request.chain = None
-        mark_court_done_on_date(pacer_court_id, next_end_date)
-        return
-    docket.blocked, docket.date_blocked = get_blocked_status(docket)
-    docket.save()
+@app.task(bind=True, max_retries=20)
+def get_and_save_free_document_report(self, court_id, start, end, session):
+    """Download the Free document report and save it to the DB.
 
-    de, de_created = DocketEntry.objects.update_or_create(
-        docket=docket,
-        entry_number=result.document_number,
-        defaults={
-            'date_filed': result.date_filed,
-            'description': result.description,
-        }
-    )
-    rd, rd_created = RECAPDocument.objects.update_or_create(
-        docket_entry=de,
-        document_number=result.document_number,
-        attachment_number=None,
-        defaults={
-            'pacer_doc_id': result.pacer_doc_id,
-            'document_type': RECAPDocument.PACER_DOCUMENT,
-        }
-    )
-
-    if rd_created and rd.is_available:
-        logger.info("Found the item already in the DB with document_number: %s "
-                    "and docket_entry: %s!" % (result.document_number, de))
-        self.request.chain = None
-        mark_court_done_on_date(pacer_court_id, next_end_date)
-        return
-
-    return {'result': result, 'rd_pk': rd.pk}
-
-
-@app.task(bind=True, max_retries=5)
-def get_and_process_pdf(self, data, court_id, session):
-    result = data['result']
-    rd = RECAPDocument.objects.get(pk=data['rd_pk'])
+    :param self: The Celery task.
+    :param court_id: A pacer court id.
+    :param start: a date object representing the first day to get results.
+    :param end: a date object representing the last day to get results.
+    :param session: A PACER Session object
+    :return: None
+    """
     report = FreeOpinionReport(court_id, session)
     try:
+        report.query(start, end, sort='case_number')
+    except (ConnectionError, ChunkedEncodingError, ReadTimeoutError,
+            ReadTimeout, ConnectTimeout) as exc:
+        logger.warning("Unable to get free document report results from %s "
+                       "(%s to %s). Trying again." % (court_id, start, end))
+        if self.request.retries == self.max_retries:
+            return PACERFreeDocumentLog.SCRAPE_FAILED
+        raise self.retry(exc=exc, countdown=10)
+
+    try:
+        results = report.data
+    except (IndexError, HTTPError) as exc:
+        # IndexError: When the page isn't downloaded properly.
+        # HTTPError: raise_for_status in parse hit bad status.
+        if self.request.retries == self.max_retries:
+            return PACERFreeDocumentLog.SCRAPE_FAILED
+        raise self.retry(exc=exc, countdown=10)
+
+    for row in results:
+        try:
+            PACERFreeDocumentRow.objects.create(
+                court_id=row.court_id,
+                pacer_case_id=row.pacer_case_id,
+                docket_number=row.docket_number,
+                case_name=row.case_name,
+                date_filed=row.date_filed,
+                pacer_doc_id=row.pacer_doc_id,
+                document_number=row.document_number,
+                description=row.description,
+                nature_of_suit=row.nature_of_suit,
+                cause=row.cause,
+             )
+        except IntegrityError:
+            # Duplicate for whatever reason.
+            continue
+
+    return PACERFreeDocumentLog.SCRAPE_SUCCESSFUL
+
+
+@app.task(bind=True, max_retries=5, ignore_result=True)
+def process_free_opinion_result(self, row_pk, cnt):
+    """Process a single result from the free opinion report"""
+    result = PACERFreeDocumentRow.objects.get(pk=row_pk)
+    result.court = Court.objects.get(pk=map_pacer_to_cl_id(result.court_id))
+    result.case_name = harmonize(result.case_name)
+    result.case_name_short = cnt.make_case_name_short(result.case_name)
+    row_copy = copy.copy(result)
+    # If we don't do this, the doc's date_filed becomes the docket's
+    # date_filed. Bad.
+    delattr(row_copy, 'date_filed')
+    # If we don't do this, we get the PACER court id and it crashes
+    delattr(row_copy, 'court_id')
+    # If we don't do this, the id of result tries to smash that of the docket.
+    delattr(row_copy, 'id')
+    try:
+        with transaction.atomic():
+            docket = lookup_and_save(row_copy)
+            if not docket:
+                msg = "Unable to create docket for %s" % result
+                logger.error(msg)
+                result.error_msg = msg
+                result.save()
+                self.request.callbacks = None
+                return
+            docket.blocked, docket.date_blocked = get_blocked_status(docket)
+            docket.save()
+
+            de, de_created = DocketEntry.objects.update_or_create(
+                docket=docket,
+                entry_number=result.document_number,
+                defaults={
+                    'date_filed': result.date_filed,
+                    'description': result.description,
+                }
+            )
+            rd, rd_created = RECAPDocument.objects.update_or_create(
+                docket_entry=de,
+                document_number=result.document_number,
+                attachment_number=None,
+                defaults={
+                    'pacer_doc_id': result.pacer_doc_id,
+                    'document_type': RECAPDocument.PACER_DOCUMENT,
+                    'is_free_on_pacer': True,
+                }
+            )
+    except IntegrityError as e:
+        msg = "Raised IntegrityError: %s" % e
+        logger.error(msg)
+        if self.request.retries == self.max_retries:
+            result.error_msg = msg
+            result.save()
+            return
+        raise self.retry(exc=e)
+    except DatabaseError as e:
+        msg = "Unable to complete database transaction:\n%s" % e
+        logger.error(msg)
+        result.error_msg = msg
+        result.save()
+        self.request.callbacks = None
+        return
+
+    if not rd_created and rd.is_available:
+        # The item already exists and is available. Fantastic, mark it as free,
+        # and call it a day.
+        rd.is_free_on_pacer = True
+        rd.save()
+        result.delete()
+        self.request.callbacks = None
+        return
+
+    return {'result': result, 'rd_pk': rd.pk, 'pacer_court_id': result.court_id}
+
+
+@app.task(bind=True, max_retries=15, interval_start=5, interval_step=5,
+          ignore_result=True)
+def get_and_process_pdf(self, data, session, row_pk, index=False):
+    if data is None:
+        return
+    result = data['result']
+    rd = RECAPDocument.objects.get(pk=data['rd_pk'])
+    report = FreeOpinionReport(data['pacer_court_id'], session)
+    try:
         r = report.download_pdf(result.pacer_case_id, result.pacer_doc_id)
-    except ConnectionError as exc:
+    except (ConnectTimeout, ConnectionError, ReadTimeout, ReadTimeoutError,
+            ChunkedEncodingError) as exc:
         logger.warning("Unable to get PDF for %s" % result)
-        raise self.retry(exc=exc, countdown=5)
+        raise self.retry(exc=exc)
+    except HTTPError as exc:
+        if exc.response.status_code in [HTTP_500_INTERNAL_SERVER_ERROR,
+                                        HTTP_504_GATEWAY_TIMEOUT]:
+            logger.warning("Ran into HTTPError: %s. Retrying." %
+                           exc.response.status_code)
+            raise self.retry(exc)
+        else:
+            msg = "Ran into unknown HTTPError. %s. Aborting." % \
+                  exc.response.status_code
+            logger.error(msg)
+            PACERFreeDocumentRow.objects.filter(pk=row_pk).update(error_msg=msg)
+            self.request.callbacks = None
+            return
+
+    if r is None:
+        msg = "Unable to get PDF for %s at %s with doc id %s" % \
+              (result, result.court_id, result.pacer_doc_id)
+        logger.error(msg)
+        PACERFreeDocumentRow.objects.filter(pk=row_pk).update(error_msg=msg)
+        self.request.callbacks = None
+        return
 
     file_name = get_document_filename(
         result.court.pk,
@@ -185,7 +303,7 @@ def get_and_process_pdf(self, data, court_id, session):
     rd.page_count = get_page_count(rd.filepath_local.path, 'pdf')
 
     # Save and extract, skipping OCR.
-    rd.save(do_extraction=False, index=False)
+    rd.save(do_extraction=False, index=index)
     extract_recap_pdf(rd.pk, skip_ocr=True, check_if_needed=False)
     return {'result': result, 'rd_pk': rd.pk}
 
@@ -194,27 +312,26 @@ class OverloadedException(Exception):
     pass
 
 
-@app.task(bind=True, max_retries=15)
-def upload_free_opinion_to_ia(self, data):
-    countdown = 5 * self.request.retries + 1  # 5s, 10s, 15s...
-    result = data['result']
-    rd = RECAPDocument.objects.get(pk=data['rd_pk'])
+@app.task(bind=True, max_retries=15, interval_start=5, interval_step=5)
+def upload_free_opinion_to_ia(self, rd_pk):
+    rd = RECAPDocument.objects.get(pk=rd_pk)
+    d = rd.docket_entry.docket
     file_name = get_document_filename(
-        result.court.pk,
-        result.pacer_case_id,
-        result.document_number,
+        d.court_id,
+        d.pacer_case_id,
+        rd.document_number,
         0,  # Attachment number is zero for all free opinions.
     )
-    bucket_name = get_bucket_name(result.court.pk, result.pacer_case_id)
+    bucket_name = get_bucket_name(d.court_id, d.pacer_case_id)
     try:
         responses = upload_to_ia(
             identifier=bucket_name,
             files=rd.filepath_local.path,
             metadata={
-                'title': result.case_name,
+                'title': best_case_name(d),
                 'collection': settings.IA_COLLECTIONS,
                 'contributor': '<a href="https://free.law">Free Law Project</a>',
-                'court': result.court.pk,
+                'court': d.court_id,
                 'language': 'eng',
                 'mediatype': 'texts',
                 'description': "This item represents a case in PACER, "
@@ -225,12 +342,33 @@ def upload_free_opinion_to_ia(self, data):
                 'licenseurl': 'https://www.usa.gov/government-works',
             },
         )
-    except OverloadedException as exc:
-        raise self.retry(exc=exc, countdown=countdown)
+    except (OverloadedException, ExpatError) as exc:
+        # Overloaded: IA wants us to slow down.
+        # ExpatError: The syntax of the XML file that's supposed to be returned
+        #             by IA is bad (or something).
+        if self.request.retries == self.max_retries:
+            # Give up for now. It'll get done next time cron is run.
+            return
+        raise self.retry(exc=exc)
     except HTTPError as exc:
-        if exc.response.status_code == HTTP_403_FORBIDDEN:
+        if exc.response.status_code in [
+            HTTP_403_FORBIDDEN,    # Can't access bucket, typically.
+            HTTP_400_BAD_REQUEST,  # Corrupt PDF, typically.
+        ]:
             return [exc.response]
-        raise self.retry(exc=exc, countdown=countdown)
+        if self.request.retries == self.max_retries:
+            # This exception is also raised when the endpoint is overloaded, but
+            # doesn't get caught in the OverloadedException below due to
+            # multiple processes running at the same time. Just give up for now.
+            return
+        raise self.retry(exc=exc)
+    except (requests.Timeout, requests.RequestException) as exc:
+        logger.warning("Timeout or unknown RequestException. Unable to upload "
+                       "to IA. Trying again if retries not exceeded: %s" % rd)
+        if self.request.retries == self.max_retries:
+            # Give up for now. It'll get done next time cron is run.
+            return
+        raise self.retry(exc=exc)
     if all(r.ok for r in responses):
         rd.filepath_ia = "https://archive.org/download/%s/%s" % (
             bucket_name, file_name)
@@ -288,13 +426,326 @@ def upload_to_ia(identifier, files, metadata=None):
 
 
 @app.task
-def mark_court_done_on_date(court_id, d):
+def mark_court_done_on_date(status, court_id, d):
     court_id = map_pacer_to_cl_id(court_id)
-    doc_log = PACERFreeDocumentLog.objects.filter(
-        status=PACERFreeDocumentLog.SCRAPE_IN_PROGRESS,
-        court_id=court_id,
-    ).latest('date_queried')
-    doc_log.date_queried = d
-    doc_log.status = PACERFreeDocumentLog.SCRAPE_SUCCESSFUL
-    doc_log.date_completed = now()
-    doc_log.save()
+    try:
+        doc_log = PACERFreeDocumentLog.objects.filter(
+            status=PACERFreeDocumentLog.SCRAPE_IN_PROGRESS,
+            court_id=court_id,
+        ).latest('date_queried')
+    except PACERFreeDocumentLog.DoesNotExist:
+        return
+    else:
+        doc_log.date_queried = d
+        doc_log.status = status
+        doc_log.date_completed = now()
+        doc_log.save()
+
+    return status
+
+
+@app.task(ignore_result=True)
+def delete_pacer_row(pk):
+    PACERFreeDocumentRow.objects.get(pk=pk).delete()
+
+
+@app.task(bind=True, max_retries=2, interval_start=5 * 60,
+          interval_step=10 * 60, ignore_result=True)
+def get_pacer_case_id_for_idb_row(self, pk, session):
+    """Populate the pacer_case_id field in the FJC IDB table for an item in the
+    IDB table
+    """
+    logger.info("Getting pacer_case_id for IDB item with pk %s" % pk)
+    item = FjcIntegratedDatabase.objects.get(pk=pk)
+    pcn = PossibleCaseNumberApi(map_cl_to_pacer_id(item.district_id), session)
+    pcn.query(item.docket_number)
+    d = pcn.data(case_name='%s v. %s' % (item.plaintiff, item.defendant))
+    if d is not None:
+        item.pacer_case_id = d['pacer_case_id']
+        item.case_name = d['title']
+    else:
+        # Hack. Storing the error in here will bite us later.
+        item.pacer_case_id = "Error"
+    item.save()
+
+
+@app.task(bind=True, max_retries=5, interval_start=5 * 60,
+          interval_step=10 * 60, ignore_result=True)
+def get_docket_by_pacer_case_id(self, pacer_case_id, court_id, session,
+                                tag=None, **kwargs):
+    """Get a docket by PACER case id, CL court ID, and a collection of kwargs
+    that can be passed to the DocketReport query.
+
+    For details of acceptable parameters, see DocketReport.query()
+
+    :param pacer_case_id: The internal case ID of the item in PACER.
+    :param court_id: A courtlistener court ID.
+    :param session: A valid PacerSession object.
+    :param tag: The tag name that should be stored with the item in the DB.
+    :param kwargs: A variety of keyword args to pass to DocketReport.query().
+    """
+    report = DocketReport(map_cl_to_pacer_id(court_id), session)
+    logger.info("Querying docket report %s.%s" % (court_id, pacer_case_id))
+    try:
+        d = Docket.objects.get(
+            pacer_case_id=pacer_case_id,
+            court_id=court_id,
+        )
+    except Docket.DoesNotExist:
+        d = None
+    except Docket.MultipleObjectsReturned:
+        d = None
+
+    if d is not None:
+        first_missing_id = get_first_missing_de_number(d)
+        if d is not None and first_missing_id > 1:
+            # We don't have to get the whole thing!
+            kwargs.setdefault('doc_num_start', first_missing_id)
+
+    report.query(pacer_case_id, **kwargs)
+    docket_data = report.data
+    logger.info("Querying and parsing complete for %s.%s" % (court_id,
+                                                             pacer_case_id))
+
+    # Merge the contents into CL.
+    try:
+        if d is None:
+            d = Docket.objects.get(
+                Q(pacer_case_id=pacer_case_id) |
+                Q(docket_number=docket_data['docket_number']),
+                court_id=court_id,
+            )
+        # Add RECAP as a source if it's not already.
+        if d.source in [Docket.DEFAULT, Docket.SCRAPER]:
+            d.source = Docket.RECAP_AND_SCRAPER
+        elif d.source == Docket.COLUMBIA:
+            d.source = Docket.COLUMBIA_AND_RECAP
+        elif d.source == Docket.COLUMBIA_AND_SCRAPER:
+            d.source = Docket.COLUMBIA_AND_RECAP_AND_SCRAPER
+    except Docket.DoesNotExist:
+        d = Docket(
+            source=Docket.RECAP,
+            pacer_case_id=pacer_case_id,
+            court_id=court_id
+        )
+    except Docket.MultipleObjectsReturned:
+        logger.error("Too many dockets returned when trying to look up '%s.%s'" %
+                     (court_id, pacer_case_id))
+        return None
+
+    update_docket_metadata(d, docket_data)
+    d.save()
+    if tag is not None:
+        tag, _ = Tag.objects.get_or_create(name=tag)
+        d.tags.add(tag)
+
+    # Add the HTML to the docket in case we need it someday.
+    pacer_file = PacerHtmlFiles(content_object=d)
+    pacer_file.filepath.save(
+        'docket.html',  # We only care about the ext w/UUIDFileSystemStorage
+        ContentFile(report.response.text),
+    )
+
+    for docket_entry in docket_data['docket_entries']:
+        try:
+            de, created = DocketEntry.objects.update_or_create(
+                docket=d,
+                entry_number=docket_entry['document_number'],
+                defaults={
+                    'description': docket_entry['description'],
+                    'date_filed': docket_entry['date_filed'],
+                }
+            )
+        except DocketEntry.MultipleObjectsReturned:
+            logger.error(
+                "Multiple docket entries found for document entry number '%s' "
+                "while processing '%s.%s'" % (docket_entry['document_number'],
+                                              court_id, pacer_case_id)
+            )
+            continue
+        else:
+            if tag is not None:
+                de.tags.add(tag)
+
+        try:
+            rd = RECAPDocument.objects.get(
+                docket_entry=de,
+                # No attachments when uploading dockets.
+                document_type=RECAPDocument.PACER_DOCUMENT,
+                document_number=docket_entry['document_number'],
+            )
+        except RECAPDocument.DoesNotExist:
+            try:
+                rd = RECAPDocument.objects.create(
+                    docket_entry=de,
+                    # No attachments when uploading dockets.
+                    document_type=RECAPDocument.PACER_DOCUMENT,
+                    document_number=docket_entry['document_number'],
+                    pacer_doc_id=docket_entry['pacer_doc_id'],
+                    is_available=False,
+                )
+            except IntegrityError:
+                # Race condition. The item was created after our get failed.
+                rd = RECAPDocument.objects.get(
+                    docket_entry=de,
+                    # No attachments when uploading dockets.
+                    document_type=RECAPDocument.PACER_DOCUMENT,
+                    document_number=docket_entry['document_number'],
+                )
+        except RECAPDocument.MultipleObjectsReturned:
+            logger.error(
+                "Multiple recap documents found for document entry "
+                "number: '%s', docket: %s" % (docket_entry['document_number'], d)
+            )
+            continue
+
+        rd.pacer_doc_id = rd.pacer_doc_id or docket_entry['pacer_doc_id']
+        if tag is not None:
+            rd.tags.add(tag)
+
+    add_parties_and_attorneys(d, docket_data['parties'])
+    logger.info("Created/updated docket: %s" % d)
+
+    return d
+
+
+@app.task(bind=True, max_retries=15, interval_start=5,
+          interval_step=5, ignore_result=True)
+def get_pacer_doc_by_rd_and_description(self, rd_pk, description_re, session,
+                                        fallback_to_main_doc=False, tag=None):
+    """Using a RECAPDocument object ID and a description of a document, get the
+    document from PACER.
+
+    This function was originally meant to get civil cover sheets, but can be
+    repurposed as needed.
+
+    :param rd_pk: The PK of a RECAPDocument object to use as a source.
+    :param description_re: A compiled regular expression to search against the
+    description provided by the attachment page.
+    :param session: The PACER session object to use.
+    :param fallback_to_main_doc: Should we grab the main doc if none of the
+    attachments match the regex?
+    :param tag: A tag name to apply to any downloaded content.
+    :return: None
+    """
+    rd = RECAPDocument.objects.get(pk=rd_pk)
+    if not rd.pacer_doc_id:
+        # Some docket entries are just text/don't have a pacer_doc_id.
+        self.request.callbacks = None
+        return
+
+    d = rd.docket_entry.docket
+    pacer_court_id = map_cl_to_pacer_id(d.court_id)
+    att_report = AttachmentPage(pacer_court_id, session)
+    try:
+        att_report.query(rd.pacer_doc_id)
+    except (ConnectTimeout, ConnectionError, ReadTimeout, ReadTimeoutError,
+            ChunkedEncodingError) as exc:
+        logger.warning("Unable to get PDF for %s" % rd)
+        raise self.retry(exc=exc)
+    except HTTPError as exc:
+        if exc.response.status_code in [HTTP_500_INTERNAL_SERVER_ERROR,
+                                        HTTP_504_GATEWAY_TIMEOUT]:
+            logger.warning("Ran into HTTPError: %s. Retrying." %
+                           exc.response.status_code)
+            raise self.retry(exc)
+        else:
+            msg = "Ran into unknown HTTPError. %s. Aborting." % \
+                  exc.response.status_code
+            logger.error(msg)
+            self.request.callbacks = None
+            return
+
+    att_found = None
+    for attachment in att_report.data.get('attachments', []):
+        if description_re.search(attachment['description']):
+            att_found = attachment.copy()
+            document_type = RECAPDocument.ATTACHMENT
+            break
+
+    if not att_found:
+        if fallback_to_main_doc:
+            logger.info("Falling back to main document for pacer_doc_id: %s" %
+                        rd.pacer_doc_id)
+            att_found = att_report.data
+            document_type = RECAPDocument.PACER_DOCUMENT
+        else:
+            msg = "Aborting. Did not find civil cover sheet for %s." % rd
+            logger.error(msg)
+            self.request.callbacks = None
+            return
+
+    if not att_found.get('pacer_doc_id'):
+        logger.warn("No pacer_doc_id for document (is it sealed?)")
+        self.request.callbacks = None
+        return
+
+    # Try to find the attachment already in the collection
+    rd, _ = RECAPDocument.objects.get_or_create(
+        docket_entry=rd.docket_entry,
+        attachment_number=att_found.get('attachment_number'),
+        document_number=rd.document_number,
+        pacer_doc_id=att_found['pacer_doc_id'],
+        document_type=document_type,
+        defaults={
+            'date_upload': now(),
+        },
+    )
+    # Replace the description if we have description data. Else fallback on old.
+    rd.description = att_found.get('description', '') or rd.description
+    if tag is not None:
+        tag, _ = Tag.objects.get_or_create(name=tag)
+        rd.tags.add(tag)
+
+    if rd.is_available:
+        # Great. Call it a day.
+        rd.save(do_extraction=False, index=False)
+        return
+
+    # Not available. Go get it.
+    try:
+        pacer_case_id = rd.docket_entry.docket.pacer_case_id
+        r = att_report.download_pdf(pacer_case_id, att_found['pacer_doc_id'])
+    except (ConnectTimeout, ConnectionError, ReadTimeout, ReadTimeoutError,
+            ChunkedEncodingError) as exc:
+        logger.warning("Unable to get PDF for %s" % att_found['pacer_doc_id'])
+        raise self.retry(exc=exc)
+    except HTTPError as exc:
+        if exc.response.status_code in [HTTP_500_INTERNAL_SERVER_ERROR,
+                                        HTTP_504_GATEWAY_TIMEOUT]:
+            logger.warning("Ran into HTTPError: %s. Retrying." %
+                           exc.response.status_code)
+            raise self.retry(exc)
+        else:
+            msg = "Ran into unknown HTTPError. %s. Aborting." % \
+                  exc.response.status_code
+            logger.error(msg)
+            self.request.callbacks = None
+            return
+
+    if r is None:
+        msg = "Unable to get PDF for %s at PACER court '%s' with doc id %s" % \
+              (rd, pacer_court_id, rd.pacer_doc_id)
+        logger.error(msg)
+        self.request.callbacks = None
+        return
+
+    file_name = get_document_filename(
+        d.court_id,
+        pacer_case_id,
+        rd.document_number,
+        rd.attachment_number,
+    )
+    cf = ContentFile(r.content)
+    rd.filepath_local.save(file_name, cf, save=False)
+    rd.is_available = True  # We've got the PDF.
+
+    # request.content is sometimes a str, sometimes unicode, force it all to be
+    # bytes, pleasing hashlib.
+    rd.sha1 = hashlib.sha1(force_bytes(r.content)).hexdigest()
+    rd.page_count = get_page_count(rd.filepath_local.path, 'pdf')
+
+    # Save, extract, then save to Solr. Skip OCR for now. Don't do these async.
+    rd.save(do_extraction=False, index=False)
+    extract_recap_pdf(rd.pk, skip_ocr=True)
+    add_or_update_recap_document([rd.pk])

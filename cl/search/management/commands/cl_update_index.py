@@ -1,12 +1,13 @@
 import ast
 import sys
 
-from celery.task.sets import TaskSet
 from django.conf import settings
-from django.core.management.base import BaseCommand
+from six.moves import input
 
 from cl.audio.models import Audio
+from cl.lib.command_utils import VerboseCommand, logger
 from cl.lib.argparse_types import valid_date_time, valid_obj_type
+from cl.lib.celery_utils import CeleryThrottle
 from cl.lib.db_tools import queryset_generator
 from cl.lib.scorched_utils import ExtraSolrInterface
 from cl.lib.timer import print_timing
@@ -28,8 +29,8 @@ def proceed_with_deletion(out, count, noinput):
 
     proceed = True
     out.write("\n")
-    yes_or_no = raw_input('WARNING: Are you **sure** you want to delete all '
-                          '%s items? [y/N] ' % count)
+    yes_or_no = input('WARNING: Are you **sure** you want to delete all %s '
+                      'items? [y/N] ' % count)
     out.write('\n')
     if not yes_or_no.lower().startswith('y'):
         out.write("No action taken.\n")
@@ -37,8 +38,8 @@ def proceed_with_deletion(out, count, noinput):
 
     if count > 10000 and proceed is True:
         # Double check...something might be off.
-        yes_or_no = raw_input('Are you double-plus sure? There are an awful '
-                              'lot of items here? [y/N] ')
+        yes_or_no = input('Are you sure? There are an awful lot of items here? '
+                          '[y/N] ')
         if not yes_or_no.lower().startswith('y'):
             out.write("No action taken.\n")
             proceed = False
@@ -46,7 +47,7 @@ def proceed_with_deletion(out, count, noinput):
     return proceed
 
 
-class Command(BaseCommand):
+class Command(VerboseCommand):
     help = ('Adds, updates, deletes items in an index, committing changes and '
             'optimizing it, if requested.')
 
@@ -79,6 +80,11 @@ class Command(BaseCommand):
             action='store_true',
             help="Do NOT prompt the user for input of any kind. Useful in "
                  "tests, but can disable important warnings."
+        )
+        parser.add_argument(
+            '--queue',
+            default='batch3',
+            help="The celery queue where the tasks should be processed.",
         )
 
         actions_group = parser.add_mutually_exclusive_group()
@@ -153,6 +159,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        super(Command, self).handle(*args, **options)
         self.verbosity = int(options.get('verbosity', 1))
         self.options = options
         self.noinput = options['noinput']
@@ -203,47 +210,33 @@ class Command(BaseCommand):
                               'index.\n')
             sys.exit(1)
 
-    def _chunk_queryset_into_tasks(self, items, count, chunksize=50,
-                                   bundle_size=250, start_at=0):
+    def process_queryset(self, items, count, chunksize=50,):
         """Chunks the queryset passed in, and dispatches it to Celery for
         adding to the index.
-
-            bundle_size: how many items are in a task
-            chunksize: how many tasks we create before enqueueing them.
-
-        Potential performance improvements:
-         - Postgres is quiescent when Solr is popping tasks from Celery,
-           instead, it should be fetching the next 1,000
         """
+        queue = self.options['queue']
+        start_at = self.options['start_at']
+        # Set low throttle. Higher values risk crashing Redis.
+        throttle = CeleryThrottle(min_items=30, queue_name=queue)
         processed_count = 0
-        subtasks = []
-        item_bundle = []
+        chunk = []
         for item in items:
             processed_count += 1
-            last_item = (count == processed_count)
             if processed_count < start_at:
                 continue
-
-            item_bundle.append(item)
-            if (len(item_bundle) >= bundle_size) or last_item:
-                # Every bundle_size documents we create a subtask
-                subtasks.append(
-                    add_or_update_items.subtask((item_bundle, self.solr_url))
-                )
-                item_bundle = []
-
-            if (len(subtasks) >= chunksize) or last_item:
-                # Every chunksize items, we send the subtasks for processing
-                job = TaskSet(tasks=subtasks)
-                job.apply_async().join()
-                subtasks = []
-
-            sys.stdout.write("\rProcessed {}/{} ({:.0%})".format(
-                processed_count,
-                count,
-                processed_count * 1.0 / count,
-            ))
-            self.stdout.flush()
+            last_item = (count == processed_count)
+            chunk.append(item)
+            if processed_count % chunksize == 0 or last_item:
+                throttle.maybe_wait()
+                add_or_update_items.apply_async(args=(chunk, self.solr_url),
+                                                queue=queue)
+                chunk = []
+                sys.stdout.write("\rProcessed {}/{} ({:.0%})".format(
+                    processed_count,
+                    count,
+                    processed_count * 1.0 / count,
+                    ))
+                self.stdout.flush()
         self.stdout.write('\n')
 
     @print_timing
@@ -328,7 +321,7 @@ class Command(BaseCommand):
         qs = self.type.objects.filter(date_created__gte=dt)
         items = queryset_generator(qs, chunksize=5000)
         count = qs.count()
-        self._chunk_queryset_into_tasks(items, count)
+        self.process_queryset(items, count)
 
     @print_timing
     def add_or_update_all(self):
@@ -339,7 +332,6 @@ class Command(BaseCommand):
         If run on an existing index, existing items will be updated.
         """
         self.stdout.write("Adding or updating all items...\n")
-        bundle_size = 250
         if self.type == Person:
             q = self.type.objects.filter(
                 is_alias_of=None
@@ -359,105 +351,18 @@ class Command(BaseCommand):
             q = [item for item in q if item.is_judge]
             count = len(q)
         elif self.type == RECAPDocument:
-            q = self.type.objects.all().prefetch_related(
-                # IDs
-                'docket_entry__pk',
-                'docket_entry__docket__pk',
-                'docket_entry__docket__court__pk',
-                'docket_entry__docket__assigned_to__pk',
-                'docket_entry__docket__referred_to__pk',
-
-                # Docket Entry
-                'docket_entry__description',
-                'docket_entry__entry_number',
-                'docket_entry__date_filed',
-
-                # Docket
-                'docket_entry__docket__date_argued',
-                'docket_entry__docket__date_filed',
-                'docket_entry__docket__date_terminated',
-                'docket_entry__docket__docket_number',
-                'docket_entry__docket__case_name_short',
-                'docket_entry__docket__case_name',
-                'docket_entry__docket__case_name_full',
-                'docket_entry__docket__nature_of_suit',
-                'docket_entry__docket__cause',
-                'docket_entry__docket__jury_demand',
-                'docket_entry__docket__jurisdiction_type',
-                'docket_entry__docket__slug',
-
-                # Judges
-                'docket_entry__docket__assigned_to__name_first',
-                'docket_entry__docket__assigned_to__name_middle',
-                'docket_entry__docket__assigned_to__name_last',
-                'docket_entry__docket__assigned_to__name_suffix',
-                'docket_entry__docket__assigned_to_str',
-                'docket_entry__docket__referred_to__name_first',
-                'docket_entry__docket__referred_to__name_middle',
-                'docket_entry__docket__referred_to__name_last',
-                'docket_entry__docket__referred_to__name_suffix',
-                'docket_entry__docket__referred_to_str',
-
-                # Court
-                'docket_entry__docket__court__full_name',
-                'docket_entry__docket__court__citation_string',
-
-                # Party, attorney, firm
-                'docket_entry__docket__parties__pk',
-                'docket_entry__docket__parties__name',
-                'docket_entry__docket__parties__attorneys__pk',
-                'docket_entry__docket__parties__attorneys__name',
-                'docket_entry__docket__parties__attorneys__organizations__pk',
-                'docket_entry__docket__parties__attorneys__organizations__name',
-            )
+            q = self.type.objects.all()
             count = q.count()
             q = queryset_generator(q, chunksize=5000)
         elif self.type == Docket:
-            q = Docket.objects.filter(
-                source__in=Docket.RECAP_SOURCES
-            ).prefetch_related(
-                # IDs
-                'docket_entries__pk',
-                'assigned_to__pk',
-                'referred_to__pk',
-
-                # Court
-                'court__full_name',
-                'court__citation_string',
-                'court__id',
-
-                # Judges
-                'assigned_to__name_first',
-                'assigned_to__name_middle',
-                'assigned_to__name_last',
-                'assigned_to__name_suffix',
-                'referred_to__name_first',
-                'referred_to__name_middle',
-                'referred_to__name_last',
-                'referred_to__name_suffix',
-
-                # Docket entries
-                'docket_entries__description',
-                'docket_entries__entry_number',
-                'docket_entries__date_filed',
-
-                # Parties, attorneys, firms
-                'parties__pk',
-                'parties__name',
-                'parties__attorneys__pk',
-                'parties__attorneys__name',
-                'parties__attorneys__organizations__pk',
-                'parties__attorneys__organizations__name',
-            )
+            q = Docket.objects.filter(source__in=Docket.RECAP_SOURCES)
             count = q.count()
             q = queryset_generator(q, chunksize=5000)
-            bundle_size = 10  # Too big and things start dropping/failing.
         else:
             q = self.type.objects.all()
             count = q.count()
             q = queryset_generator(q, chunksize=5000)
-        self._chunk_queryset_into_tasks(q, count, bundle_size=bundle_size,
-                                        start_at=self.options['start_at'])
+        self.process_queryset(q, count)
 
     @print_timing
     def optimize(self):

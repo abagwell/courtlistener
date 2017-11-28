@@ -1,3 +1,4 @@
+# coding=utf-8
 import json
 import os
 
@@ -10,10 +11,10 @@ from django.http import HttpResponseRedirect, Http404
 from django.shortcuts import render, get_object_or_404
 from django.template import loader
 from django.views.decorators.cache import cache_page
+from rest_framework.status import HTTP_429_TOO_MANY_REQUESTS
 
 from cl.audio.models import Audio
 from cl.custom_filters.decorators import check_honeypot
-from cl.custom_filters.templatetags.text_filters import naturalduration
 from cl.lib import magic
 from cl.lib.bot_detector import is_bot
 from cl.people_db.models import Person
@@ -38,10 +39,9 @@ def faq(request):
         'total_opinion_count': OpinionCluster.objects.all().count(),
         'total_recap_count': RECAPDocument.objects.filter(
             is_available=True).count(),
-        'total_oa_minutes': naturalduration(
-            Audio.objects.aggregate(Sum('duration'))['duration__sum'],
-            as_dict=True
-        )['m'],
+        'total_oa_minutes': (Audio.objects.aggregate(
+            Sum('duration')
+        )['duration__sum'] or 0) / 60,
         'total_judge_count': Person.objects.all().count(),
     }
 
@@ -192,14 +192,14 @@ def advanced_search(request):
 
 def old_terms(request, v):
     return render(request, 'terms/%s.html' % v, {
-        'title': 'Archived Terms of Service and Policies, v%s - CourtListener.com' % v,
+        'title': u'Archived Terms of Service and Policies, v%s – CourtListener.com' % v,
         'private': True
     })
 
 
 def latest_terms(request):
     return render(request, 'terms/latest.html', {
-        'title': 'Terms of Service and Policies - CourtListener.com',
+        'title': u'Terms of Service and Policies – CourtListener.com',
         'private': False
     })
 
@@ -244,6 +244,11 @@ def tools_page(request):
 
 def browser_warning(request):
     return render(request, 'browser_warning.html', {'private': True})
+
+
+def ratelimited(request, exception):
+    return render(request, '429.html', {'private': True},
+                  status=HTTP_429_TOO_MANY_REQUESTS)
 
 
 def serve_static_file(request, file_path=''):
